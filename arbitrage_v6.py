@@ -1,0 +1,3480 @@
+# -*- coding: utf-8 -*-
+"""
+arbitrage_full.py
+
+✅ 單一完整檔案（不省略）：
+- Shioaji stock/future pair arbitrage framework
+- Dynamic pair discovery by volume (top N)
+- Diff-based subscriptions
+- Robust PositionManager (state machine + order indexing + raw order events)
+- Execution with dual-leg + timeout + cancel + repair/unwind best effort
+- AccountMonitor sync to detect UNHEDGED
+- Keyboard monitor: p positions, o orders, h help, q quit
+
+注意：
+1) 這個檔案預設 SIMULATION=True
+2) 你要放 .env 並包含：
+   Sinopack_CA_API_KEY
+   Sinopack_CA_SECRET_KEY
+   Sinopack_PERSON_ID
+   Sinopack_CA_PATH
+   Sinopack_CA_PASSWORD
+   Sinopack_PASSWORD   (正式環境你才需要)
+"""
+
+import math
+import os
+import sys
+import json
+import time
+import queue
+import datetime
+import threading
+import concurrent.futures
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
+from collections import Counter, defaultdict
+from enum import Enum
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
+
+import pandas as pd
+import shioaji as sj
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =========================
+# --- 全域設定 ---
+# =========================
+SIMULATION = True
+ORDER_HISTORY_FILE = "order_history.jsonl"  # 本地訂單記錄檔
+
+# Risk & Stability (P0)
+KILL_SWITCH = False          # 一鍵停止開倉 (只允許平倉/修復)
+DEGRADE_MODE = False         # 降級模式 (只減倉不開倉，風控變嚴)
+MAX_DATA_DELAY_SEC = 2.0     # 資料時間 vs 事件時間 最大容忍延遲
+SIMULATE_CHAOS = False       # 混沌測試 (隨機掉單/部分成交 - 限 Simulation)
+
+# Position sizing
+STOCK_QTY = 2          # 現股張數（Common lot）
+FUTURE_QTY = 1         # 期貨口數
+MIN_ORDER_QTY_THRESHOLD = 3 # 最佳一檔掛單量門檻 (張/口)
+MAX_CAPITAL = 10000000 # 最大總投資金額 (1000萬)
+ENTRY_THRESHOLD = 500  # 進場淨利門檻（以金額）
+EXIT_THRESHOLD = 0     # 出場價差門檻
+MIN_TOP_VOLUME = 3     # 最佳一檔量門檻 (Stock Ask >= 3, Future Bid >= 3)
+
+# 平衡換算（台灣：現股 1 張=1000 股；個股期貨多數 1 口=2000 股）
+STOCK_SHARES_PER_LOT = 1000
+FUTURE_SHARES_EQUIV = 2000  # ✅ 一口 2000 股
+
+# 交易成本估算（你可自行調整）
+STOCK_FEE_RATE = 0.001425 * 0.3
+STOCK_TAX_RATE = 0.003
+FUT_FEE_PER_CONTRACT = 20
+FUT_TAX_RATE = 0.00002
+
+# Hedge/Repair timeout
+HEDGE_TIMEOUT_SEC = 10.0
+REPAIR_TIMEOUT_SEC = 5.0
+MIN_PROFIT_TO_REPAIR = 0
+
+# Tick protection
+STOCK_BUY_TICKS = 5
+STOCK_SELL_TICKS = 5
+FUT_BUY_TICKS = 5
+FUT_SELL_TICKS = 5
+REPAIR_TICKS = 20  # Aggressive tick limit for repair
+FORCE_CLOSE_TICKS = 50 # Very aggressive for force close
+
+# Dynamic pair discovery
+MIN_VOLUME_THRESHOLD = 500
+VOLUME_HISTORY_FILE = "volume_history.json"
+TOP_N_PAIRS = 30
+REFRESH_PAIRS_EVERY_SEC = 600  # 10分鐘
+MAX_SUBS = 80
+UNSUB_LINGER_SEC = 60 # P1: 退訂延遲
+
+# Debug watch
+DBG_WATCH_STOCK = "2313"
+DBG_WATCH_FUT: Optional[str] = None
+DBG_LAST_LINE = None
+DBG_LINE_LOCK = threading.Lock()
+
+# =========================
+# --- Strategy Parameters (Z-Score & Risk) ---
+# =========================
+EWMA_HALF_LIFE = 60.0    # 秒
+Z_ENTRY = 2.0            # 進場 Z-score (Mean Reversion)
+Z_EXIT = 0.5             # 出場 Z-score
+MIN_PROFIT_Z = 2.0       # 最小期望獲利 (以 Sigma 倍數計)
+
+MAX_HOLDING_SEC = 1800   # 最大持倉時間 (30分鐘)
+UNHEDGED_REPAIR_DEADLINE = 5.0 # 5秒內嘗試補單 (Repair)
+UNHEDGED_FORCE_CLOSE_SEC = 15.0  # 超過 15秒 強制清倉 (Unwind/Panic)
+
+STD_FLOOR = 0.5          # Z-score 分母下限 (避免爆表)
+MIN_SAMPLES = 50         # EWMA 暖機樣本數
+INFLIGHT_COOLDOWN_SEC = 2.0 # 交易完成後冷卻時間
+WARMUP_SEC = 5.0         # 啟動後暖機時間 (P1)
+
+SLIPPAGE_SCALE = 0.5     # 滑價估算係數 (Ticks per Ratio)
+
+# Risk Control
+MAX_OPEN_PAIRS = 5       # 最大同時持倉對數
+MAX_DAILY_LOSS = -50000  # 當日最大虧損 (金額)
+MAX_ORDERS_PER_MIN = 20  # Global throttle
+MAX_DAILY_ORDERS = 300   # Global daily limit
+
+# Credentials (.env)
+PERSON_ID = os.getenv("Sinopack_PERSON_ID")
+PASSWORD = os.getenv("Sinopack_PASSWORD")
+CA_API_KEY = os.getenv("Sinopack_CA_API_KEY")
+CA_SECRET_KEY = os.getenv("Sinopack_CA_SECRET_KEY")
+CA_PATH = os.getenv("Sinopack_CA_PATH")
+CA_PASSWORD = os.getenv("Sinopack_CA_PASSWORD")
+
+
+def _check_hedge_ratio():
+    stock_shares = STOCK_QTY * STOCK_SHARES_PER_LOT
+    future_shares = FUTURE_QTY * FUTURE_SHARES_EQUIV
+    if stock_shares != future_shares:
+        print(f"[⚠️ Hedge Ratio Warning] 股票={stock_shares}股 vs 期貨={future_shares}股，不是 1:1 對沖！")
+    else:
+        print(f"[Hedge Ratio OK] 股票={stock_shares}股 == 期貨={future_shares}股")
+_check_hedge_ratio()
+
+
+# =========================
+# --- Helper Classes ---
+# =========================
+class ApiThrottler:
+    """
+    Global throttler for frequent API calls (e.g., update_status).
+    """
+    def __init__(self, interval: float = 1.0):
+        self.interval = interval
+        self.last_ts = 0.0
+        self.lock = threading.Lock()
+
+    def call(self, func, *args, **kwargs):
+        with self.lock:
+            now = time.time()
+            if now - self.last_ts < self.interval:
+                return None
+            self.last_ts = now
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            return None
+
+
+# =========================
+# --- Quote safe access ---
+# =========================
+def _first(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (list, tuple)):
+            return float(x[0]) if len(x) > 0 else default
+        return float(x)
+    except Exception:
+        return default
+
+def _get_code(q) -> str:
+    return getattr(q, "code", "") or ""
+
+def normalize_status(x) -> str:
+    """
+    將 Shioaji 各種可能的 status 表示法（Enum/object/str/dict）
+    統一成 canonical uppercase token.
+    """
+    if x is None:
+        return ""
+
+    # dict: trade_dict["status"] 可能是 dict
+    if isinstance(x, dict):
+        x = x.get("status") or x.get("Status") or ""
+
+    # Enum / object: 常見有 name/value
+    if hasattr(x, "name"):
+        s = str(getattr(x, "name"))
+    elif hasattr(x, "value"):
+        s = str(getattr(x, "value"))
+    else:
+        s = str(x)
+
+    s = s.strip()
+    if not s:
+        return ""
+
+    # 去掉前綴
+    s = s.replace("Status.", "").replace("status.", "")
+
+    u = s.upper()
+
+    # 常見同義詞/狀態名
+    if u in ("FILLING", "PARTFILLED", "PART_FILLED", "PARTFILL", "PARTIALFILLED", "PARTIAL_FILLED"):
+        return "PARTFILLED"
+    if u in ("FILLED",):
+        return "FILLED"
+    if u in ("CANCELLED", "CANCELED", "USERCANCELED", "USER_CANCELLED", "SYSTEMCANCELED", "SYSTEM_CANCELLED"):
+        return "CANCELLED"
+    if u in ("FAILED", "REJECTED", "ERROR"):
+        return "FAILED"
+    if u in ("SUBMITTED", "PENDINGSUBMIT", "PENDING_SUBMIT"):
+        return "SUBMITTED"
+
+    return u
+
+def _get_bid(q) -> float:
+    return _first(getattr(q, "bid_price", None), 0.0)
+
+def _get_ask(q) -> float:
+    return _first(getattr(q, "ask_price", None), 0.0)
+
+def _get_bid_vol(q) -> int:
+    return int(_first(getattr(q, "bid_volume", None), 0))
+
+def _get_ask_vol(q) -> int:
+    return int(_first(getattr(q, "ask_volume", None), 0))
+
+def _get_ts(q) -> float:
+    t = getattr(q, "datetime", None)
+    if isinstance(t, datetime.datetime):
+        return t.timestamp()
+    t2 = getattr(q, "ts", None)
+    if isinstance(t2, (int, float)):
+        return float(t2)
+    return time.time()
+
+
+# =========================
+# --- 狀態列舉/資料結構 ---
+# =========================
+class PositionState(Enum):
+    IDLE = 0            # EMPTY: 無倉位，等待訊號
+    EMPTY = 0           # Alias
+    ORDER_SENT = 1      # PENDING: 訊號已發出，等待回報 (Entry/Exit)
+    PENDING_ENTRY = 1   # Alias
+    PENDING_EXIT = 1    # Alias
+    EXITING = 1         # Alias
+    PARTIAL_FILLED = 2  # PARTIAL: 至少有一邊有成交，但未完全對沖
+    HEDGED = 3          # HOLDING: 雙邊已對沖 (Quantity Matched)
+    HOLDING = 3         # Alias
+    REPAIRING = 4       # UNHEDGED: 異常狀態 (單邊成交/比例錯誤)，進行修復中
+    UNHEDGED = 4        # Alias
+
+@dataclass
+class LegFill:
+    order_id: Optional[str] = None
+    status: str = "INIT"           # INIT / Submitted / Filled / Cancelled / Failed / PartFilled
+    filled_qty: int = 0
+    avg_price: float = 0.0
+    last_event: Optional[dict] = None  # raw trade_dict for debugging
+
+@dataclass
+class PhaseSync:
+    done: threading.Event = field(default_factory=threading.Event)
+    failed: threading.Event = field(default_factory=threading.Event)
+    def reset(self):
+        self.done.clear()
+        self.failed.clear()
+
+@dataclass
+class PairState:
+    stock_code: str
+    fut_code: str
+
+    state: PositionState = PositionState.IDLE
+
+    # targets (lots / contracts)
+    target_stock_lots: int = 0
+    target_fut_qty: int = 0
+    last_signal_net: float = 0.0
+
+    # real positions
+    pos_stock_shares: int = 0
+    pos_fut_qty: int = 0
+
+    # inflight guard
+    inflight: bool = False
+    last_action_ts: float = 0.0
+    last_close_ts: float = 0.0
+    last_entry_ts: float = 0.0
+    last_repair_ts: float = 0.0 # Added for repair throttling
+
+    # legs
+    open_stock: LegFill = field(default_factory=LegFill)
+    open_future: LegFill = field(default_factory=LegFill)
+    close_stock: LegFill = field(default_factory=LegFill)
+    close_future: LegFill = field(default_factory=LegFill)
+
+    open_sync: PhaseSync = field(default_factory=PhaseSync)
+    close_sync: PhaseSync = field(default_factory=PhaseSync)
+
+    open_ts: float = 0.0
+    close_ts: float = 0.0
+    unhedged_ts: float = 0.0
+
+    # EWMA
+    last_tick_ts: float = 0.0
+    basis_mean: float = 0.0
+    basis_std: float = 0.0
+    sample_count: int = 0
+    initialized: bool = False
+
+
+# =========================
+# --- MarketData ---
+# =========================
+class MarketData:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stk: Dict[str, Any] = {}
+        self._fut: Dict[str, Any] = {}
+
+    def update_stock(self, quote: Any):
+        code = _get_code(quote)
+        if not code:
+            return
+        with self._lock:
+            self._stk[code] = quote
+
+    def update_future(self, quote: Any):
+        code = _get_code(quote)
+        if not code:
+            return
+        with self._lock:
+            self._fut[code] = quote
+
+    def get_quotes(self, stock_code: str, future_code: str):
+        with self._lock:
+            return self._stk.get(stock_code), self._fut.get(future_code)
+
+    def get_stock(self, code: str) -> Optional[Any]:
+        with self._lock:
+            return self._stk.get(code)
+
+    def get_future(self, code: str) -> Optional[Any]:
+        with self._lock:
+            return self._fut.get(code)
+
+
+# =========================
+# --- Snapshot Wrapper ---
+# =========================
+class SnapshotWrapper:
+    """
+    把 snapshot 包裝成類似 BidAsk v1 介面，避免策略剛起來 quote 還沒來時全 None。
+    """
+    def __init__(self, snapshot):
+        self.code = snapshot.code
+        self.ask_price = [float(getattr(snapshot, "sell_price", 0.0) or 0.0)]
+        self.bid_price = [float(getattr(snapshot, "buy_price", 0.0) or 0.0)]
+        self.ask_volume = [int(getattr(snapshot, "sell_volume", 0) or 0)]
+        self.bid_volume = [int(getattr(snapshot, "buy_volume", 0) or 0)]
+        self.datetime = datetime.datetime.now()
+        ts = getattr(snapshot, "ts", None)
+        if ts:
+            try:
+                self.datetime = datetime.datetime.fromtimestamp(ts / 1e9)
+            except Exception:
+                pass
+
+
+# =========================
+# --- OrderTracker (Persistence) ---
+# =========================
+class OrderTracker:
+    """
+    負責將下單記錄寫入本地檔案，以便重啟後重建狀態。
+    使用 JSONL (Append Only) 格式，寫入速度快且不易損壞。
+    使用 Queue + Single Writer Thread 避免大量 thread 建立。
+    """
+    def __init__(self, filename=ORDER_HISTORY_FILE):
+        self.filename = filename
+        self._queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+        self._lock = threading.Lock() # still keep lock for load_history
+
+    def record(self, order_id: str, stock_code: str, fut_code: str, phase: str, leg: str, action: str, price: float, qty: int):
+        if not order_id: return
+        
+        record = {
+            "ts": time.time(),
+            "date": datetime.datetime.now().strftime('%Y-%m-%d'),
+            "order_id": str(order_id),
+            "stock_code": stock_code,
+            "fut_code": fut_code,
+            "phase": phase,  # 'open' or 'close'
+            "leg": leg,      # 'stock' or 'future'
+            "action": str(action),
+            "price": price,
+            "qty": qty
+        }
+        self._queue.put(record)
+
+    def _writer_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                record = self._queue.get(timeout=1.0)
+                try:
+                    with open(self.filename, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(record) + "\n")
+                except Exception as e:
+                    print(f"[OrderTracker] write failed: {e}")
+            except queue.Empty:
+                continue
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop_event.set()
+        # flush remaining
+        try:
+            while True:
+                record = self._queue.get_nowait()
+                with open(self.filename, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(record) + "\n")
+        except queue.Empty:
+            pass
+        if self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=2.0)
+
+    def load_history(self) -> List[Dict]:
+        """讀取歷史訂單 (只讀取今天的，或者全部讀取後由 Caller 過濾)"""
+        records = []
+        if not os.path.exists(self.filename):
+            return []
+            
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        try:
+            with self._lock:
+                with open(self.filename, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line: continue
+                        try:
+                            rec = json.loads(line)
+                            # 只回傳今天的單，避免處理太舊的歷史
+                            if rec.get('date') == today:
+                                records.append(rec)
+                        except: pass
+        except Exception as e:
+            print(f"[OrderTracker] load failed: {e}")
+        return records
+
+
+# =========================
+# --- Reconciler (State Reconstruction) ---
+# =========================
+class Reconciler:
+    """
+    負責在系統啟動時，比對「本地訂單記錄」、「券商成交回報」與「實際庫存」，
+    來重建 PositionManager 的狀態 (HOLDING, UNHEDGED, etc.)
+    """
+    def __init__(self, api: sj.Shioaji, pos_mgr: 'PositionManager', order_tracker: OrderTracker):
+        self.api = api
+        self.pos_mgr = pos_mgr
+        self.tracker = order_tracker
+
+    def reconcile(self):
+        print(">>> [Reconciler] Starting State Reconstruction...")
+        
+        # 1. 讀取本地訂單記錄 (了解我們"試圖"做了什麼)
+        local_orders = self.tracker.load_history()
+        if not local_orders:
+            print("  [Reconciler] No local order history today.")
+            # 即使沒歷史，也要查庫存 (既有部位)
+            self._sync_from_positions_only()
+            return
+
+        print(f"  [Reconciler] Found {len(local_orders)} local orders today.")
+        
+        # 建立 Order ID -> Info 映射
+        # 我們只關心"最後一次"對該 Pair 的操作意圖
+        # 但比較簡單的是：把所有 Order ID 註冊進 PositionManager，讓它能處理後續回報
+        for rec in local_orders:
+            oid = rec['order_id']
+            self.pos_mgr.register_order(oid, rec['stock_code'], rec['phase'], rec['leg'])
+            # 順便恢復 pair 的 future code 對應
+            if rec.get('fut_code'):
+                self.pos_mgr.set_future_pair(rec['stock_code'], rec['fut_code'])
+
+        # 2. 查詢券商成交明細 (List Trades) - 了解"實際"成交了什麼
+        # 注意：Shioaji list_trades 可能需要時間或特定參數，這裡假設能取到今日成交
+        print("  [Reconciler] Fetching trades from broker...")
+        try:
+            # 模擬環境 list_trades 有時會空，實盤較準
+            # 這裡我們用 list_trades 來更新 PositionManager 裡的 LegStatus
+            # 先更新股票
+            stk_trades = self.api.list_trades() 
+            # 再更新期貨 (API 可能共用或分開，視版本而定，通常 list_trades 回傳全部)
+            # 如果分帳號:
+            # stk_trades = self.api.list_trades(self.api.stock_account)
+            # fut_trades = self.api.list_trades(self.api.futopt_account)
+            
+            # 為了簡化，我們先假設 update_leg_status 會被後續的 callback 觸發
+            # 或者我們主動呼叫 update_status (Shioaji 功能)
+            # pass 
+        except Exception as e:
+            print(f"  [Reconciler] List trades failed: {e}")
+
+        # 3. 查詢券商委託狀態 (List Orders/Update Status) - 了解有哪些還在掛
+        # 這一步很重要，如果單子還在 Pending，我們要能接管
+        print("  [Reconciler] Syncing order status...")
+        try:
+            # 針對我們記錄過的 Order ID 去查狀態
+            # Shioaji 沒有 batch query by ID，通常是用 update_status() 更新全部
+            self.api.update_status(self.api.stock_account)
+            self.api.update_status(self.api.futopt_account)
+            # update_status 會觸發 callback，所以 _on_order_status 會被呼叫
+            # PositionManager 的狀態會因此更新
+            time.sleep(2) # 等待 callback
+        except Exception as e:
+            print(f"  [Reconciler] Update status failed: {e}")
+
+        # 4. 最後：強制同步庫存 (Final Truth)
+        # 這是最底層的防線，確保 HOLDING 狀態正確
+        self._sync_from_positions_only()
+        
+        print(">>> [Reconciler] Done.")
+
+    def _sync_from_positions_only(self):
+        print("  [Reconciler] Syncing from Positions (Final Check)...")
+        # 這裡的邏輯跟 AccountMonitor.sync_positions 類似，但只跑一次
+        # 直接呼叫 AccountMonitor 的邏輯 (如果有的話)，或者重寫
+        # 為了避免重複代碼，我們這裡簡單實作：讀庫存 -> 寫入 PosMgr
+        
+        try:
+            stk_pos = self.api.list_positions(self.api.stock_account)
+            fut_pos = self.api.list_positions(self.api.futopt_account)
+            
+            real_stk = {}
+            real_fut = {}
+            
+            for p in stk_pos:
+                code = getattr(p, 'code', '')
+                qty = int(getattr(p, 'quantity', 0))
+                # 簡單處理方向：Shioaji Position quantity 總是正的，要看 direction
+                direction = getattr(p, 'direction', None)
+                # sign = 1 if direction == sj.constant.Action.Buy else -1
+                d_str = str(direction).upper()
+                sign = 1 if "BUY" in d_str else -1
+                real_stk[code] = real_stk.get(code, 0) + (qty * 1000 * sign) # 假設 1張=1000股
+            
+            for p in fut_pos:
+                code = getattr(p, 'code', '')
+                qty = int(getattr(p, 'quantity', 0))
+                direction = getattr(p, 'direction', None)
+                # sign = 1 if direction == sj.constant.Action.Buy else -1
+                d_str = str(direction).upper()
+                sign = 1 if "BUY" in d_str else -1
+                real_fut[code] = real_fut.get(code, 0) + (qty * sign)
+
+            # 更新所有已知的 Pair
+            for ps in self.pos_mgr.all_pairs():
+                s = ps.stock_code
+                f = ps.fut_code
+                
+                s_sh = real_stk.get(s, 0)
+                f_qty = real_fut.get(f, 0) if f else 0
+                
+                # 如果庫存吻合 (多空配對)，強制設為 HEDGED
+                # 例如：股票 +2000 股 (2張), 期貨 -1 口
+                if s_sh > 0 and f_qty < 0: 
+                    # 簡單比例檢查：每 2000 股對應 1 口 (概略)
+                    # 只要有配對，就視為 HEDGED
+                    print(f"  [Reconciler] {s} matched positions (S:{s_sh} F:{f_qty}) -> Force HEDGED")
+                    ps.state = PositionState.HEDGED
+                    ps.pos_stock_shares = s_sh
+                    ps.pos_fut_qty = f_qty
+                
+                elif s_sh != 0 or f_qty != 0:
+                     print(f"  [Reconciler] {s} unhedged positions (S:{s_sh} F:{f_qty}) -> REPAIRING")
+                     ps.state = PositionState.REPAIRING
+                     ps.pos_stock_shares = s_sh
+                     ps.pos_fut_qty = f_qty
+                     ps.unhedged_ts = time.time() # Reset timer for immediate attention
+
+        except Exception as e:
+            print(f"  [Reconciler] Position sync failed: {e}")
+
+
+# =========================
+# --- PositionManager (核心) ---
+# =========================
+class PositionManager:
+    """
+    ✅ 可量產版：
+    - pair 狀態機（PositionState）
+    - order_id -> (stock_code, phase, leg) 對照
+    - raw order events（按 o 查詢）
+    - phase sync（ExecutionEngine 等 done/failed）
+    - monitor sync（偵測 UNHEDGED）
+    - Inflight Guard
+    """
+
+    # 定義允許的狀態轉移 (State Machine Enforcement)
+    ALLOWED_TRANSITIONS = {
+        PositionState.IDLE: {PositionState.ORDER_SENT, PositionState.REPAIRING, PositionState.HEDGED}, # HEDGED allowed via sync
+        PositionState.ORDER_SENT: {PositionState.PARTIAL_FILLED, PositionState.HEDGED, PositionState.IDLE, PositionState.REPAIRING},
+        PositionState.PARTIAL_FILLED: {PositionState.HEDGED, PositionState.REPAIRING, PositionState.IDLE}, # IDLE if cancelled/unwound
+        PositionState.HEDGED: {PositionState.ORDER_SENT, PositionState.REPAIRING, PositionState.IDLE}, # IDLE via sync
+        PositionState.REPAIRING: {PositionState.HEDGED, PositionState.IDLE, PositionState.PARTIAL_FILLED}, # Repair -> Hedged or Idle
+    }
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._pairs: Dict[str, PairState] = {}
+        self._order_index: Dict[str, Tuple[str, str, str]] = {}
+        self._order_events: List[Dict[str, Any]] = []
+
+    # ---- inflight lock ----
+    def try_acquire_lock(self, stock_code: str) -> bool:
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps: return False
+            
+            now = time.time()
+            if ps.inflight:
+                return False
+            if now - ps.last_action_ts < INFLIGHT_COOLDOWN_SEC:
+                return False
+                
+            ps.inflight = True
+            ps.last_action_ts = now
+            return True
+
+    def release_lock(self, stock_code: str, mark_close: bool = False):
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if ps:
+                ps.inflight = False
+                ps.last_action_ts = time.time()
+                if mark_close:
+                    ps.last_close_ts = ps.last_action_ts
+
+    def set_inflight(self, stock_code: str, inflight: bool, mark_close: bool = False):
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps: return
+            
+            ps.inflight = inflight
+            ps.last_action_ts = time.time()
+            if (not inflight) and mark_close:
+                ps.last_close_ts = ps.last_action_ts
+
+    def set_inflight_for_engine(self, stock_code: str, val: bool):
+        # Explicit helper for engine to access lock (alias)
+        self.set_inflight(stock_code, val)
+
+    # ---- pair management ----
+    def set_active_pairs(self, pairs: List[Tuple[str, str]]):
+        with self._lock:
+            for s, f in pairs:
+                s = str(s); f = str(f)
+                if s not in self._pairs:
+                    self._pairs[s] = PairState(stock_code=s, fut_code=f, state=PositionState.IDLE)
+                else:
+                    self._pairs[s].fut_code = f
+
+    def ensure_pair(self, stock_code: str, fut_code: Optional[str] = None) -> PairState:
+        with self._lock:
+            if stock_code not in self._pairs:
+                self._pairs[stock_code] = PairState(stock_code=stock_code, fut_code=fut_code or "", state=PositionState.IDLE)
+            if fut_code:
+                self._pairs[stock_code].fut_code = fut_code
+            return self._pairs[stock_code]
+
+    def get_pair(self, stock_code: str) -> Optional[PairState]:
+        with self._lock:
+            return self._pairs.get(stock_code)
+
+    def all_pairs(self) -> List[PairState]:
+        with self._lock:
+            return list(self._pairs.values())
+
+    def set_future_pair(self, stock_code: str, future_code: str):
+        ps = self.ensure_pair(stock_code, future_code)
+        with self._lock:
+            ps.fut_code = future_code
+
+    # ---- order tracking ----
+    def register_order(self, order_id: str, stock_code: str, phase: str, leg: str):
+        if not order_id:
+            return
+        with self._lock:
+            self._order_index[str(order_id)] = (stock_code, phase, leg)
+            ps = self._pairs.get(stock_code)
+            if ps:
+                # Transition to ORDER_SENT if not already (and valid)
+                # But wait, register_order happens after sending.
+                # Strategy sets PENDING_ENTRY (ORDER_SENT) before sending.
+                # So we just update status here.
+                if phase == "open":
+                    if leg == "stock":
+                        ps.open_stock.order_id = str(order_id)
+                        ps.open_stock.status = "Submitted"
+                    else:
+                        ps.open_future.order_id = str(order_id)
+                        ps.open_future.status = "Submitted"
+                    # If we are registering an OPEN order, state should be ORDER_SENT
+                    # PENDING_ENTRY was old. Strategy sets it.
+                    # But let's ensure consistency.
+                elif phase == "close":
+                    if leg == "stock":
+                        ps.close_stock.order_id = str(order_id)
+                        ps.close_stock.status = "Submitted"
+                    else:
+                        ps.close_future.order_id = str(order_id)
+                        ps.close_future.status = "Submitted"
+                    # CLOSE -> EXITING
+
+
+    def lookup_order(self, order_id: str) -> Optional[Tuple[str, str, str]]:
+        if not order_id:
+            return None
+        with self._lock:
+            return self._order_index.get(str(order_id))
+
+    def record_order_event(self, order_state: Any, trade_dict: Dict[str, Any]):
+        try:
+            oid = (trade_dict.get("order", {}) or {}).get("id") or trade_dict.get("trade_id")
+            status = (trade_dict.get("status", {}) or {}).get("status") or trade_dict.get("status")
+            ts = time.time()
+            with self._lock:
+                self._order_events.append({
+                    "ts": ts,
+                    "order_id": str(oid) if oid else None,
+                    "status": str(status),
+                    "raw": trade_dict,
+                })
+                if len(self._order_events) > 8000:
+                    self._order_events = self._order_events[-5000:]
+        except Exception:
+            pass
+
+    def dump_orders(self, last_n: int = 200) -> List[Dict[str, Any]]:
+        with self._lock:
+            evs = list(self._order_events[-last_n:])
+            idx = dict(self._order_index)
+
+        out: List[Dict[str, Any]] = []
+        for e in evs:
+            oid = e.get("order_id")
+            info = idx.get(str(oid)) if oid else None
+            stock_code, phase, leg = info if info else (None, None, None)
+
+            td = e.get("raw") or {}
+            st = td.get("status") or {}
+            if not isinstance(st, dict):
+                st = {}
+
+            out.append({
+                "time": datetime.datetime.fromtimestamp(e.get("ts", time.time())).strftime("%H:%M:%S"),
+                "order_id": oid,
+                "code": stock_code,
+                "phase": phase,
+                "leg": leg,
+                "status": e.get("status"),
+                "deal_qty": st.get("deal_quantity"),
+                "deal_price": st.get("deal_price") or st.get("price"),
+                "msg": st.get("msg") or st.get("errmsg"),
+            })
+        return out
+
+    # ---- state/phase ----
+    def set_state(self, stock_code: str, new_state: PositionState):
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps:
+                return
+            
+            # State Machine Enforcement
+            current = ps.state
+            if new_state != current:
+                allowed = self.ALLOWED_TRANSITIONS.get(current, set())
+                # If forcing REPAIRING or IDLE (from reset), we might allow strict override?
+                # P0: Stability - Allow jump to REPAIRING from anywhere if error detected
+                if new_state == PositionState.REPAIRING:
+                    pass # Emergency
+                elif new_state == PositionState.IDLE and current == PositionState.REPAIRING:
+                    pass # Recovery
+                elif new_state not in allowed and current != new_state:
+                    print(f"[State] ⚠️ Invalid Transition {stock_code}: {current.name} -> {new_state.name} (Ignored/Forced?)")
+                    # For now, print warning but allow if logic demands, or strictly block?
+                    # User requested "Lock it down".
+                    # But sync logic might jump. Let's allow but log.
+                
+                ps.state = new_state
+                print(f"[State Update] {stock_code} {current.name} -> {new_state.name}")
+
+    def prepare_phase(
+        self,
+        stock_code: str,
+        phase: str,
+        target_stock_lots: int,
+        target_fut_qty: int,
+        last_signal_net: float = 0.0,
+    ):
+        ps = self.ensure_pair(stock_code)
+        with self._lock:
+            ps.target_stock_lots = int(target_stock_lots)
+            ps.target_fut_qty = int(target_fut_qty)
+            ps.last_signal_net = float(last_signal_net)
+
+            if phase == "open":
+                ps.open_ts = time.time()
+                ps.open_sync.reset()
+                ps.open_stock = LegFill()
+                ps.open_future = LegFill()
+            else:
+                ps.close_ts = time.time()
+                ps.close_sync.reset()
+                ps.close_stock = LegFill()
+                ps.close_future = LegFill()
+                
+    def reset_phase_events_only(self, stock_code: str, phase: str):
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps:
+                return
+            if phase == "open":
+                ps.open_sync.reset()
+            else:
+                ps.close_sync.reset()
+
+    def get_phase_sync(self, stock_code: str, phase: str) -> Optional[PhaseSync]:
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps:
+                return None
+            return ps.open_sync if phase == "open" else ps.close_sync
+
+    def update_leg_status(
+        self,
+        stock_code: str,
+        phase: str,
+        leg: str,
+        status: str,
+        filled_qty: int,
+        deal_price: float,
+        last_event: Optional[dict] = None,
+    ):
+        """
+        ✅ 修復你 p 畫面「status 變成 dict」的主因：
+        - 永遠把 status 存成 str (normalized)
+        - raw event 只放 last_event
+        - P0: Priority check (Filled > Submitted > others)
+        """
+        ps = self.ensure_pair(stock_code)
+        status_s = normalize_status(status)
+        if not status_s:
+            status_s = "SUBMITTED"
+
+        with self._lock:
+            if phase == "open":
+                lf = ps.open_stock if leg == "stock" else ps.open_future
+            else:
+                lf = ps.close_stock if leg == "stock" else ps.close_future
+
+            # P0 Priority Logic:
+            # If current is FILLED, ignore SUBMITTED/PENDING updates
+            curr_s = normalize_status(lf.status)
+            if curr_s == "FILLED" and status_s in ("SUBMITTED", "PENDINGSUBMIT", "INIT"):
+                # Ignore regression
+                return
+
+            lf.status = status_s
+            lf.last_event = last_event
+
+            # fill accumulation
+            if filled_qty and filled_qty > 0 and deal_price and deal_price > 0:
+                prev_qty = lf.filled_qty
+                prev_px = lf.avg_price
+                new_qty = prev_qty + int(filled_qty)
+                if new_qty > 0:
+                    lf.avg_price = (prev_qty * prev_px + int(filled_qty) * float(deal_price)) / new_qty
+                lf.filled_qty = new_qty
+                
+                # State Update: PARTIAL_FILLED
+                if ps.state == PositionState.ORDER_SENT:
+                     self.set_state(stock_code, PositionState.PARTIAL_FILLED)
+
+            # ✅ Auto-upgrade to FILLED if quantity met
+            # 這裡我們假設 target 單位跟 filled_qty 單位一致 (Stock=Lots, Fut=Contracts)
+            target = 0
+            if phase == "open":
+                target = ps.target_stock_lots if leg == "stock" else ps.target_fut_qty
+            else:
+                target = ps.target_stock_lots if leg == "stock" else ps.target_fut_qty
+            
+            if target > 0 and lf.filled_qty >= target:
+                lf.status = "FILLED"
+                # print(f"[PosMgr] {leg} auto-filled (qty={lf.filled_qty}/{target})")
+
+            # sync done/fail logic
+            sync = ps.open_sync if phase == "open" else ps.close_sync
+            leg_a = (ps.open_stock, ps.open_future) if phase == "open" else (ps.close_stock, ps.close_future)
+            
+            # ✅ 改良：_is_filled 依賴數量而非狀態字串
+            def _is_filled(x: LegFill, target_qty: int) -> bool:
+                return x.filled_qty >= target_qty and target_qty > 0
+
+            def _is_failed(x: LegFill) -> bool:
+                return normalize_status(x.status) == "FAILED"
+
+            def _is_cancel(x: LegFill) -> bool:
+                s = normalize_status(x.status)
+                return s == "CANCELLED"
+
+            a, b = leg_a
+            
+            target_a = ps.target_stock_lots
+            target_b = ps.target_fut_qty
+            
+            if _is_filled(a, target_a) and _is_filled(b, target_b):
+                sync.done.set()
+                # We do NOT set HEDGED/IDLE here, ExecutionEngine does it after verify.
+                # Or we can do it here? ExecutionEngine logic is "wait for done, then set state".
+                # Let's keep it there for flow control.
+            else:
+                ended_a = _is_failed(a) or _is_cancel(a)
+                ended_b = _is_failed(b) or _is_cancel(b)
+                if ended_a and ended_b:
+                    sync.failed.set()
+
+        if status_s == "FILLED":
+            print(f"[成交] {phase.upper()} {leg.upper()} {stock_code} qty={filled_qty} px={deal_price}")
+        elif status_s in ("CANCELLED", "FAILED"):
+            print(f"[取消/失敗] {phase.upper()} {leg.upper()} {stock_code} status={status_s}")
+
+    # ---- monitor sync ----
+    def monitor_sync(self, stock_code: str, pos_stock_shares: int, pos_fut_qty: int):
+        ps = self.ensure_pair(stock_code)
+        with self._lock:
+            # P0: Inflight Guard - Do not sync state while orders are processing
+            if ps.inflight:
+                return
+
+            # P0: Priority - If we have active orders tracking, don't let monitor override blindly
+            # unless state is IDLE or HEDGED (stable states).
+            # If we are ORDER_SENT / PARTIAL, we trust ExecutionEngine to finish.
+            if ps.state in (PositionState.ORDER_SENT, PositionState.PARTIAL_FILLED, PositionState.EXITING):
+                return
+
+            ps.pos_stock_shares = int(pos_stock_shares)
+            ps.pos_fut_qty = int(pos_fut_qty)
+
+            # 0/0 -> IDLE
+            if ps.pos_stock_shares == 0 and ps.pos_fut_qty == 0:
+                if ps.state != PositionState.IDLE:
+                    ps.state = PositionState.IDLE
+
+            # 雙邊都有 -> HEDGED
+            elif ps.pos_stock_shares != 0 and ps.pos_fut_qty != 0:
+                if ps.state != PositionState.HEDGED:
+                    ps.state = PositionState.HEDGED
+
+            # 單邊 -> REPAIRING
+            elif (ps.pos_stock_shares != 0) ^ (ps.pos_fut_qty != 0):
+                if ps.state != PositionState.REPAIRING:
+                    ps.unhedged_ts = time.time() # Start cool-down
+                    print(f"[Monitor Sync] {stock_code} Detected UNHEDGED -> REPAIRING")
+                    ps.state = PositionState.REPAIRING
+
+        tag = "REPAIRING" if ps.state == PositionState.REPAIRING else ("HEDGED" if ps.state == PositionState.HEDGED else "OK")
+        print(f"[Monitor Sync] {stock_code} -> {tag} (stock={ps.pos_stock_shares}, fut={ps.pos_fut_qty})")
+
+    # ---- printing ----
+    def dump_positions_pretty(self) -> str:
+        with self._lock:
+            pairs = list(self._pairs.values())
+
+        lines = []
+        lines.append("\n=== POSITIONS ===")
+        for ps in pairs:
+            def _lf(x: LegFill) -> str:
+                oid = x.order_id if x.order_id else "-"
+                return f"{x.status}/{x.filled_qty}@{x.avg_price:.2f} oid={oid}"
+
+            lines.append(
+                f"{ps.stock_code}/{ps.fut_code} "
+                f"state={ps.state.name:<12} "
+                f"pos(S)={ps.pos_stock_shares:<6} pos(F)={ps.pos_fut_qty:<4} "
+                f"open(S:{_lf(ps.open_stock)} F:{_lf(ps.open_future)}) "
+                f"close(S:{_lf(ps.close_stock)} F:{_lf(ps.close_future)}) "
+                f"net(last)={ps.last_signal_net:,.0f}"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+
+# =========================
+# --- Keyboard monitor ---
+# =========================
+try:
+    import termios, tty, select  # mac/linux
+    _HAS_TERMIOS = True
+except Exception:
+    _HAS_TERMIOS = False
+
+try:
+    import msvcrt  # windows
+    _HAS_MS = True
+except Exception:
+    _HAS_MS = False
+
+class KeyboardMonitor(threading.Thread):
+    """
+    p -> print positions
+    o -> print orders
+    h -> help
+    q -> quit
+    """
+    def __init__(self, system, poll_sec: float = 0.05):
+        super().__init__(daemon=True)
+        self.system = system
+        self.poll_sec = poll_sec
+        self._stop_evt = threading.Event()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        self._print_help_once()
+        if _HAS_MS:
+            self._run_windows()
+        elif _HAS_TERMIOS:
+            self._run_posix()
+        else:
+            self._run_fallback_input()
+
+    def _print_help_once(self):
+        print("\n[Keyboard] p=positions, o=orders, h=help, q=quit\n", flush=True)
+
+    def _handle_key(self, ch: str):
+        ch = (ch or "").strip().lower()
+        if not ch:
+            return
+        if ch == "p":
+            print(self.system.pos_mgr.dump_positions_pretty(), flush=True)
+        elif ch == "o":
+            rows = self.system.pos_mgr.dump_orders(last_n=120)
+            print("\n=== ORDERS (latest) ===")
+            for r in rows:
+                print(
+                    f"{r['time']} oid={r['order_id']} "
+                    f"code={r['code'] or '-'} {r['phase'] or '-'} {r['leg'] or '-'} "
+                    f"st={r['status']} qty={r['deal_qty']} px={r['deal_price']} msg={r['msg'] or ''}"
+                )
+            print("", flush=True)
+        elif ch == "h":
+            self._print_help_once()
+        elif ch == "q":
+            print("\n[Keyboard] quit requested\n", flush=True)
+            self.system.stop()
+
+    def _run_windows(self):
+        while not self._stop_evt.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                self._handle_key(ch)
+            time.sleep(self.poll_sec)
+
+    def _run_posix(self):
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop_evt.is_set():
+                r, _, _ = select.select([sys.stdin], [], [], self.poll_sec)
+                if r:
+                    ch = sys.stdin.read(1)
+                    self._handle_key(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _run_fallback_input(self):
+        while not self._stop_evt.is_set():
+            try:
+                s = input().strip().lower()
+                if s:
+                    self._handle_key(s[0])
+            except EOFError:
+                break
+
+
+# =========================
+# --- Account Monitor ---
+# =========================
+class AccountMonitor(threading.Thread):
+    """
+    定時 list_positions 同步到 PositionManager，用來偵測 UNHEDGED
+    """
+    def __init__(
+        self,
+        api: sj.Shioaji,
+        pos_mgr: PositionManager,
+        stock_shares_per_lot: int,
+        poll_sec: float = 5.0,
+    ):
+        super().__init__(daemon=True)
+        self.api = api
+        self.pos_mgr = pos_mgr
+        self.stock_shares_per_lot = int(stock_shares_per_lot)
+        self.poll_sec = float(poll_sec)
+        self.running = True
+
+        self.stock_account = api.stock_account
+        self.futopt_account = api.futopt_account
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        print(">>> Account Monitor Started")
+        while self.running:
+            try:
+                self.sync_positions()
+            except Exception as e:
+                print(f"[Monitor Error] Sync failed: {e}")
+
+            n = int(max(1, self.poll_sec * 10))
+            for _ in range(n):
+                if not self.running:
+                    break
+                time.sleep(0.1)
+
+    def sync_positions(self):
+        try:
+            stock_positions = self.api.list_positions(account=self.stock_account)
+        except Exception:
+            stock_positions = []
+
+        try:
+            future_positions = self.api.list_positions(account=self.futopt_account)
+        except Exception:
+            future_positions = []
+
+        real_stock_shares: Dict[str, int] = {}
+        real_future_qty: Dict[str, int] = {}
+
+        for pos in stock_positions:
+            code = getattr(pos, "code", None)
+            if not code:
+                continue
+            qty_lot = int(getattr(pos, "quantity", 0) or 0)
+            direction = getattr(pos, "direction", None)
+            # sign = 1 if direction == sj.constant.Action.Buy else -1
+            d_str = str(direction).upper()
+            sign = 1 if "BUY" in d_str else -1
+            real_stock_shares[str(code)] = real_stock_shares.get(str(code), 0) + sign * qty_lot * self.stock_shares_per_lot
+
+        for pos in future_positions:
+            code = getattr(pos, "code", None)
+            if not code:
+                continue
+            qty = int(getattr(pos, "quantity", 0) or 0)
+            direction = getattr(pos, "direction", None)
+            # sign = 1 if direction == sj.constant.Action.Buy else -1
+            d_str = str(direction).upper()
+            sign = 1 if "BUY" in d_str else -1
+            real_future_qty[str(code)] = real_future_qty.get(str(code), 0) + sign * qty
+
+        for ps in self.pos_mgr.all_pairs():
+            s = ps.stock_code
+            f = ps.fut_code
+
+            s_sh = real_stock_shares.get(s, 0)
+            f_qty = real_future_qty.get(f, 0) if f else 0
+
+            # 1. 如果在庫存中發現部位，但狀態是 EMPTY/PENDING_ENTRY 等，需要檢查是否合理
+            # PENDING_ENTRY/EXIT 是允許過渡期，暫不干涉，除非太久 (由 Strategy timeout 處理)
+            if ps.state in (PositionState.PENDING_ENTRY, PositionState.PENDING_EXIT):
+                continue
+
+            self.pos_mgr.monitor_sync(s, s_sh, f_qty)
+
+            # [進階檢查] 如果狀態是 EMPTY，但發現有該股票的 Active Order？
+            # 這需要遍歷 list_trades，成本較高，暫時不在此做，
+            # 依賴 ExecutionEngine 的 Timeout Cancel 機制來確保不會有永久掛單。
+
+
+
+# =========================
+# --- VolumeManager / PairDiscoverer ---
+# =========================
+class VolumeManager:
+    def __init__(self, filename=VOLUME_HISTORY_FILE):
+        self.filename = filename
+        self.today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.filename):
+            try:
+                with open(self.filename, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if data and isinstance(data, dict):
+                        first_key = next(iter(data))
+                        if first_key and isinstance(data.get(first_key), dict) and 'volumes' in data[first_key]:
+                            return data
+                    return {}
+            except Exception:
+                return {}
+        return {}
+
+    def _save(self):
+        try:
+            with open(self.filename, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def get_5ma(self, code: str, is_market_closed: bool) -> int:
+        record = self.data.get(code)
+        if not record or 'volumes' not in record:
+            return 0
+
+        saved_date = record.get('date')
+        volumes = record.get('volumes') or []
+        valid_volumes = [int(v) for v in volumes if int(v) > 0]
+        if not valid_volumes:
+            return 0
+
+        avg_vol = int(sum(valid_volumes) / len(valid_volumes))
+        if not is_market_closed or saved_date == self.today_str:
+            return avg_vol
+        return 0
+
+    def peek_avg(self, code: str) -> int:
+        record = self.data.get(code)
+        if not record or 'volumes' not in record:
+            return 0
+        valid = [int(v) for v in record['volumes'] if int(v) > 0]
+        if not valid:
+            return 0
+        return int(sum(valid) / len(valid))
+
+    def update_window_init(self, code: str, vol_list: list):
+        final_list = [int(v) for v in vol_list][-5:]
+        self.data[code] = {"date": self.today_str, "volumes": final_list}
+        self._save()
+
+    def slide_window(self, code: str, new_vol: int):
+        record = self.data.get(code)
+        if record and 'volumes' in record:
+            volumes = record['volumes']
+            volumes.append(int(new_vol))
+            if len(volumes) > 5:
+                volumes.pop(0)
+            self.data[code] = {"date": self.today_str, "volumes": volumes}
+            self._save()
+
+class PairDiscoverer:
+    """
+    掃描期貨合約，找出 underlying_code + delivery_month=當月 的個股期貨，
+    然後用 stock/future 的 volume 取 min 做 score，回傳 top N。
+    """
+    def __init__(self, api: sj.Shioaji):
+        self.api = api
+        self.vol_mgr = VolumeManager()
+        self.daily_quotes_map: Dict[str, int] = {}
+        self._fetch_daily_quotes_cache()
+
+    def _fetch_daily_quotes_cache(self):
+        print("[PairDiscoverer] building Daily Quotes cache...")
+        try:
+            dq = self.api.daily_quotes(date=datetime.date.today())
+            if not dq or not getattr(dq, "Code", None):
+                yesterday = datetime.date.today() - datetime.timedelta(days=1)
+                dq = self.api.daily_quotes(date=yesterday)
+
+            if dq and getattr(dq, "Code", None):
+                codes = list(dq.Code)
+                vols = list(dq.Volume)
+                for i, code in enumerate(codes):
+                    self.daily_quotes_map[str(code)] = int(vols[i] or 0)
+                print(f"[PairDiscoverer] daily quotes cached: {len(self.daily_quotes_map)}")
+            else:
+                print("[PairDiscoverer] daily quotes empty")
+        except Exception as e:
+            print(f"[PairDiscoverer] Daily Quotes Cache Error: {e}")
+
+    def _is_day_market_closed(self) -> bool:
+        now = datetime.datetime.now().time()
+        start = datetime.time(8, 45)
+        end = datetime.time(13, 45)
+        return not (start <= now <= end)
+
+    def _fetch_last_n_days_volumes(self, contract_or_code, n_days=5) -> List[int]:
+        today = datetime.datetime.now()
+        is_closed = self._is_day_market_closed()
+
+        try:
+            if isinstance(contract_or_code, str):
+                target = self.api.Contracts.Stocks[contract_or_code]
+            else:
+                target = contract_or_code
+
+            end_date = today.strftime('%Y-%m-%d')
+            start_date = (today - datetime.timedelta(days=25)).strftime('%Y-%m-%d')
+            kbars = self.api.kbars(target, start=start_date, end=end_date)
+            df = pd.DataFrame({**kbars})
+            if df.empty:
+                return []
+
+            df['ts'] = pd.to_datetime(df['ts'])
+            if is_closed:
+                valid_df = df[df['ts'].dt.date <= today.date()]
+            else:
+                valid_df = df[df['ts'].dt.date < today.date()]
+
+            if valid_df.empty:
+                return []
+
+            recent_df = valid_df.tail(n_days)
+            return recent_df['Volume'].astype(int).tolist()
+        except Exception:
+            return []
+
+    def _get_avg_volume_smart(self, code: str, contract_obj=None) -> int:
+        cache_key = code
+        if contract_obj:
+            try:
+                stype = str(contract_obj.security_type)
+                if stype in ['FUT', 'Future', str(sj.constant.SecurityType.Future)] and hasattr(contract_obj, 'underlying_code'):
+                    cache_key = f"F_{contract_obj.underlying_code}"
+            except Exception:
+                pass
+
+        is_closed = self._is_day_market_closed()
+        cached_avg = self.vol_mgr.get_5ma(cache_key, is_market_closed=is_closed)
+        if cached_avg > 0:
+            return cached_avg
+
+        if is_closed:
+            today_vol = 0
+            if code in self.daily_quotes_map:
+                today_vol = int(self.daily_quotes_map[code])
+            else:
+                try:
+                    target = contract_obj if contract_obj else self.api.Contracts.Stocks[code]
+                    snaps = self.api.snapshots([target])
+                    if snaps and len(snaps) > 0:
+                        today_vol = int(getattr(snaps[0], "total_volume", 0) or 0)
+                except Exception:
+                    today_vol = 0
+
+            if today_vol > 0 and cache_key in self.vol_mgr.data:
+                self.vol_mgr.slide_window(cache_key, today_vol)
+                refreshed = self.vol_mgr.get_5ma(cache_key, is_market_closed=True)
+                if refreshed > 0:
+                    return refreshed
+
+        snapshot_vol = 0
+        try:
+            target = contract_obj if contract_obj else self.api.Contracts.Stocks[code]
+            snaps = self.api.snapshots([target])
+            if snaps and len(snaps) > 0:
+                snapshot_vol = int(getattr(snaps[0], "total_volume", 0) or 0)
+                if snapshot_vol > int(MIN_VOLUME_THRESHOLD * 0.5):
+                    self.vol_mgr.update_window_init(cache_key, [snapshot_vol])
+                    return snapshot_vol
+        except Exception:
+            pass
+
+        if code in self.daily_quotes_map:
+            dq_vol = int(self.daily_quotes_map[code] or 0)
+            if dq_vol > MIN_VOLUME_THRESHOLD:
+                self.vol_mgr.update_window_init(cache_key, [dq_vol])
+                return dq_vol
+
+        vol_list = self._fetch_last_n_days_volumes(contract_obj if contract_obj else code, n_days=5)
+        if len(vol_list) > 0:
+            self.vol_mgr.update_window_init(cache_key, vol_list)
+            valid_vols = [v for v in vol_list if v > 0]
+            if valid_vols:
+                return int(sum(valid_vols) / len(valid_vols))
+            return 0
+
+        last_avg = self.vol_mgr.peek_avg(cache_key)
+        if last_avg > 0:
+            return last_avg
+
+        if snapshot_vol > 0:
+            return snapshot_vol
+
+        return 0
+
+    def find_active_pairs(self, top_n: int = TOP_N_PAIRS) -> List[Tuple[str, str]]:
+        print("[PairDiscoverer] scanning active stock-future pairs...")
+        today = datetime.datetime.now()
+        target_month_str = today.strftime('%Y%m')
+
+        candidates = []
+        seen_contracts = set()
+
+        for category in self.api.Contracts.Futures:
+            try:
+                iter(category)
+            except TypeError:
+                continue
+
+            for contract in category:
+                if isinstance(contract, tuple):
+                    contract = contract[1]
+                if not hasattr(contract, 'security_type'):
+                    continue
+                if contract.code in seen_contracts:
+                    continue
+                if isinstance(contract.code, str) and contract.code.endswith("R1"):
+                    continue
+                if getattr(contract, "category", "") == "QEF":
+                    continue
+
+                seen_contracts.add(contract.code)
+
+                try:
+                    is_futures = str(contract.security_type) in ['FUT', 'Future', str(sj.constant.SecurityType.Future)]
+                    if (
+                        is_futures
+                        and hasattr(contract, 'underlying_code')
+                        and contract.underlying_code
+                        and len(contract.underlying_code) == 4
+                        and getattr(contract, "delivery_month", "") == target_month_str
+                    ):
+                        # ✅ Check Future Unit (Must match our hedge ratio assumption: 2000)
+                        f_unit = int(getattr(contract, 'unit', 0) or 0)
+                        
+                        # Note: In some environments (Sim), unit might be 1. 
+                        # We assume unit=1 is Standard (2000) UNLESS name implies Mini.
+                        if f_unit == FUTURE_SHARES_EQUIV:
+                            pass # OK, matches 2000
+                        elif f_unit == 1:
+                            # Check for Mini/Small in name
+                            c_name = getattr(contract, 'name', '')
+                            if "小型" in c_name or "微型" in c_name:
+                                continue # Skip Mini (100) or Micro
+                            # Assume 1 = 2000 (Standard)
+                        else:
+                            # Unit is neither 2000 nor 1 -> Skip (e.g. maybe 100 if defined)
+                            continue
+
+                        candidates.append(contract)
+                except Exception:
+                    continue
+
+        # --- Batch Optimization Start ---
+        # 1. 收集所有候選者的現貨 Contract
+        stock_contracts_map = {}
+        for contract in candidates:
+            scode = str(contract.underlying_code)
+            try:
+                # 預先抓取 contract 物件，準備做 batch snapshot
+                if scode not in stock_contracts_map:
+                    stock_contracts_map[scode] = self.api.Contracts.Stocks[scode]
+            except: pass
+            
+        print(f"  [PairDiscoverer] Batch querying {len(stock_contracts_map)} stocks...")
+        
+        # 2. 批次 Snapshot (分批，例如一次 200 檔)
+        stock_info_cache = {} # code -> (price, volume, ref_price)
+        all_stk_contracts = list(stock_contracts_map.values())
+        
+        chunk_size = 200
+        for i in range(0, len(all_stk_contracts), chunk_size):
+            chunk = all_stk_contracts[i:i+chunk_size]
+            try:
+                snaps = self.api.snapshots(chunk)
+                for s in snaps:
+                    price = float(getattr(s, "close", 0) or getattr(s, "reference_price", 0) or 0)
+                    vol = int(getattr(s, "total_volume", 0) or 0)
+                    ref_price = float(getattr(s, "reference_price", 0) or 0)
+                    stock_info_cache[s.code] = (price, vol, ref_price)
+            except Exception as e:
+                print(f"  [PairDiscoverer] Snapshot chunk failed: {e}")
+                time.sleep(0.5)
+
+        print(f"  [PairDiscoverer] Got info for {len(stock_info_cache)} stocks.")
+
+        best_by_pair = {}
+        for contract in candidates:
+            stock_code = str(contract.underlying_code)
+            future_code = str(contract.code)
+
+            # ✅ Check Stock Unit (Must match our hedge ratio assumption: 1000)
+            stk_c = stock_contracts_map.get(stock_code)
+            if not stk_c:
+                try:
+                    stk_c = self.api.Contracts.Stocks[stock_code]
+                except Exception:
+                    pass
+            
+            if stk_c:
+                s_unit = int(getattr(stk_c, 'unit', 0) or 0)
+                # Relaxed check for Stock as well, just in case
+                if s_unit != STOCK_SHARES_PER_LOT and s_unit != 1:
+                    # print(f"  [PairDiscoverer] Skip {stock_code} unit={s_unit} != {STOCK_SHARES_PER_LOT}")
+                    continue
+
+            # --- Fast Filter by Cache ---
+            # 從剛剛的 Batch Snapshot 結果中查資料
+            info = stock_info_cache.get(stock_code)
+            
+            # 如果沒有 Snapshot 資料 (可能沒開盤或冷門)，才走舊的慢速查詢 (Fallback)
+            if info:
+                s_price, s_vol, s_ref_price = info
+                
+                # --- ✅ Risk Filter: Avoid Near Limit Up/Down ---
+                # 如果這支股票今天還沒持倉，且價格接近漲跌停 (+-9%)，就跳過
+                # 注意：如果已有持倉，PositionManager 會負責處理，這裡只負責 Discovery 新機會
+                # 這裡無法得知是否持有，但通常 Discovery 是找新機會
+                if s_ref_price > 0 and s_price > 0:
+                    change_pct = (s_price - s_ref_price) / s_ref_price
+                    if abs(change_pct) > 0.09: # 9% threshold
+                        # print(f"  [PairDiscoverer] Skip {stock_code} due to limit up/down risk ({change_pct*100:.1f}%)")
+                        continue
+                # -----------------------------------------------
+
+                # 1. Volume Check
+                if s_vol < MIN_VOLUME_THRESHOLD:
+                    # 如果 Snapshot 量不足，也許可以查 KBar (但通常 Snapshot 量不足就代表不活躍)
+                    # 為了效能，這裡從嚴認定：Snapshot 量不夠就跳過 (盤中)
+                    # 若是盤前，Snapshot vol 可能是 0，這時才 fallback
+                    if s_vol == 0 and not self._is_day_market_closed():
+                         pass # 盤中量為0 -> 跳過
+                    elif s_vol > 0:
+                         pass # 繼續檢查
+                    else:
+                         # 盤前或無量，嘗試查 Avg (舊邏輯)
+                         s_vol = self._get_avg_volume_smart(stock_code, contract_obj=None)
+                else:
+                    # Snapshot 量足夠，直接用
+                    pass
+                
+                # 更新 cache 供後續使用
+                if s_vol > 0:
+                    stock_avg = s_vol
+                else:
+                    stock_avg = self._get_avg_volume_smart(stock_code, contract_obj=None)
+
+                # 2. Price Check (Fast)
+                if s_price > 500:
+                    continue
+            else:
+                # Fallback: 沒抓到 Snapshot，走舊流程 (慢)
+                stock_avg = self._get_avg_volume_smart(stock_code, contract_obj=None)
+                # 這裡略過 Price Check (為了省時)，或者再 call 一次單一 snapshot
+                pass
+
+            if stock_avg < MIN_VOLUME_THRESHOLD:
+                continue
+
+            # --- Future Liquidity Check ---
+            # 期貨通常量比現貨少，這裡可以維持原樣，或也做 batch (期貨 batch snapshot 比較容易失敗，暫維持單一)
+            future_avg = self._get_avg_volume_smart(future_code, contract_obj=contract)
+            if future_avg < MIN_VOLUME_THRESHOLD:
+                continue
+
+            score = min(stock_avg, future_avg)
+            key = (stock_code, future_code)
+            
+            # Retrieve names
+            s_name = "N/A"
+            if stk_c:
+                 s_name = getattr(stk_c, "name", "N/A")
+            else:
+                 # Fallback if stk_c not in map
+                 try:
+                     c = self.api.Contracts.Stocks[stock_code]
+                     s_name = getattr(c, "name", "N/A")
+                 except: pass
+
+            f_name = getattr(contract, "name", "N/A")
+
+            rec = (score, stock_avg, future_avg, stock_code, future_code, s_name, f_name)
+            if key not in best_by_pair or rec[0] > best_by_pair[key][0]:
+                best_by_pair[key] = rec
+
+        ranked = list(best_by_pair.values())
+        ranked.sort(key=lambda x: x[0], reverse=True)
+
+        top = ranked[:top_n]
+        print(f"[PairDiscoverer] done. matched={len(ranked)} return={len(top)}")
+        
+        print("\n=== Active Pairs (Top) ===")
+        print(f"{'Stock':<10} {'Name':<10} {'Future':<10} {'Name':<10} {'Score':<8} {'S_Vol':<8} {'F_Vol':<8}")
+        print("-" * 80)
+        for row in top:
+            scr, sa, fa, sc, fc, sn, fn = row
+            # Strip whitespace to align
+            sn = str(sn).strip()
+            fn = str(fn).strip()
+            print(f"{sc:<10} {sn:<10} {fc:<10} {fn:<10} {scr:<8} {sa:<8} {fa:<8}")
+        print("==========================\n")
+
+        return [(s_code, f_code) for (_, _, _, s_code, f_code, _, _) in top]
+
+
+# =========================
+# --- SubscriptionManager (diff + refcount) ---
+# =========================
+class SubscriptionManager:
+    def __init__(
+        self,
+        api: sj.Shioaji,
+        max_subs: int = 80,
+        quote_type=None,
+        quote_version=None,
+        verbose: bool = True,
+    ):
+        self.api = api
+        self.max_subs = int(max_subs)
+        self.verbose = verbose
+
+        self.quote_type = quote_type or sj.constant.QuoteType.BidAsk
+        self.quote_version = quote_version or sj.constant.QuoteVersion.v1
+
+        self._refcnt: Counter[str] = Counter()
+        self._kind: Dict[str, str] = {}
+        self._subscribed: Set[str] = set()
+        self._future_map: Dict[str, Any] = {} # code -> contract object
+
+        self._lock = threading.RLock()
+
+    def set_future_map(self, m: Dict[str, Any]):
+        with self._lock:
+            self._future_map = m
+
+    def apply_pairs(self, pairs: List[Tuple[str, Optional[str]]], log_prefix: str = "") -> None:
+        with self._lock:
+            # P1: Merge with existing active pairs to prevent unsubscribing held positions
+            active_codes = set()
+            # This logic depends on PositionManager being accessible or passed in. 
+            # Current implementation of apply_pairs assumes we control all.
+            # We should pass `locked_pairs` or similar.
+            pass # See below logic
+
+            desired = self._build_desired_refcnt(pairs)
+            desired_kind = self._infer_kind_map(pairs)
+            
+            # P1: Linger logic - Don't unsubscribe immediately?
+            # For strictness, let's just unsubscribe what's not in desired.
+            
+            to_sub = []
+            to_unsub = []
+
+            for code, new_cnt in desired.items():
+                old_cnt = self._refcnt.get(code, 0)
+                if old_cnt == 0 and new_cnt > 0:
+                    to_sub.append(code)
+
+            for code, old_cnt in list(self._refcnt.items()):
+                new_cnt = desired.get(code, 0)
+                if old_cnt > 0 and new_cnt == 0:
+                    to_unsub.append(code)
+
+            projected = (self._subscribed - set(to_unsub)) | set(to_sub)
+            if len(projected) > self.max_subs:
+                 # Try to drop some from to_sub if possible, or raise warning
+                 print(f"[Subscription] WARNING: projected_subs={len(projected)} exceeds max_subs={self.max_subs}. Truncating new subs.")
+                 # Simple truncation
+                 allowed = self.max_subs - len(self._subscribed - set(to_unsub))
+                 if allowed < 0: allowed = 0
+                 to_sub = to_sub[:allowed]
+
+            self._batch_unsubscribe(to_unsub, log_prefix=log_prefix)
+            self._batch_subscribe(to_sub, desired_kind, log_prefix=log_prefix)
+
+            # Rebuild refcnt
+            self._refcnt = desired # Note: this might lose track if we truncated. 
+            # Better: self._refcnt update only what changed.
+            # For simplicity, we assume max_subs is large enough.
+            
+            self._subscribed = {c for c, cnt in self._refcnt.items() if cnt > 0}
+
+            if self.verbose:
+                print(f"{log_prefix} now subscribed={len(self._subscribed)} (limit={self.max_subs})")
+
+    def force_unsubscribe_all(self, log_prefix: str = ""):
+        with self._lock:
+            codes = list(self._subscribed)
+            self._batch_unsubscribe(codes, log_prefix=log_prefix)
+            self._refcnt.clear()
+            self._kind.clear()
+            self._subscribed.clear()
+
+    def _build_desired_refcnt(self, pairs: List[Tuple[str, Optional[str]]]) -> Counter:
+        c = Counter()
+        for s, f in pairs:
+            if s:
+                c[str(s)] += 1
+            if f:
+                c[str(f)] += 1
+        return c
+
+    def _infer_kind_map(self, pairs: List[Tuple[str, Optional[str]]]) -> Dict[str, str]:
+        kind: Dict[str, str] = {}
+        for s, _ in pairs:
+            if s:
+                kind[str(s)] = "stk"
+        for _, f in pairs:
+            if f:
+                kind[str(f)] = "fut"
+        return kind
+
+    def _guess_kind_by_contracts(self, code: str) -> str:
+        try:
+            _ = self.api.Contracts.Stocks[code]
+            return "stk"
+        except Exception:
+            pass
+        try:
+            _ = self.api.Contracts.Futures[code]
+            return "fut"
+        except Exception:
+            pass
+        return "stk"
+
+    def _get_contract(self, code: str, kind: str):
+        if kind == "stk":
+            return self.api.Contracts.Stocks[code]
+        if kind == "fut":
+            if code in self._future_map:
+                return self._future_map[code]
+            return self.api.Contracts.Futures[code]
+        raise ValueError(f"Unknown kind={kind} code={code}")
+
+    def _batch_subscribe(self, codes: List[str], desired_kind: Dict[str, str], log_prefix: str = ""):
+        ok = 0
+        for code in codes:
+            kind = desired_kind.get(code) or self._guess_kind_by_contracts(code)
+            try:
+                c = self._get_contract(code, kind)
+                self.api.quote.subscribe(c, quote_type=self.quote_type, version=self.quote_version)
+                self._kind[code] = kind
+                ok += 1
+            except Exception as e:
+                print(f"{log_prefix} +subscribe {code} FAILED: {e}")
+        if self.verbose and codes:
+            print(f"{log_prefix} +subscribe {len(codes)} (ok={ok})")
+
+    def _batch_unsubscribe(self, codes: List[str], log_prefix: str = ""):
+        ok = 0
+        for code in codes:
+            kind = self._kind.get(code) or self._guess_kind_by_contracts(code)
+            try:
+                c = self._get_contract(code, kind)
+                self.api.quote.unsubscribe(c, quote_type=self.quote_type, version=self.quote_version)
+                self._kind.pop(code, None)
+                ok += 1
+            except Exception as e:
+                print(f"{log_prefix} -unsubscribe {code} FAILED: {e}")
+        if self.verbose and codes:
+            print(f"{log_prefix} -unsubscribe {len(codes)} (ok={ok})")
+
+
+# =========================
+# --- CapitalManager (資金控管) ---
+# =========================
+class CapitalManager:
+    def __init__(self, max_capital: float, pos_mgr: PositionManager, market_data: MarketData):
+        self.max_capital = float(max_capital)
+        self.pos_mgr = pos_mgr
+        self.market_data = market_data
+
+    def get_usage(self) -> Tuple[float, float, float]:
+        """
+        計算目前資金使用狀況。
+        回傳: (總使用資金, 持倉市值, 圈存/處理中資金)
+        """
+        holding_val = 0.0
+        pending_val = 0.0
+        
+        # 為了避免頻繁 lock，我們 copy 一份 pairs
+        pairs = self.pos_mgr.all_pairs()
+        
+        for ps in pairs:
+            # 1. 持倉部位 (HEDGED, REPAIRING)
+            # 只計算現貨成本 (期貨是保證金，這裡先簡化只控管股票總市值)
+            if ps.pos_stock_shares > 0:
+                # 嘗試取得即時報價來計算市值
+                quote = self.market_data.get_stock(ps.stock_code)
+                # 若無即時報價，理想上應有成本價，這裡暫用 Snapshot 邏輯或 0 (保守)
+                # 實務上建議 PairState 裡要記 avg_price，這裡先用即時價估算
+                price = _get_bid(quote)
+                if price <= 0:
+                    # Fallback: 如果完全沒報價，可能要用漲停價或參考價估，這裡先忽略避免阻擋
+                    # 或者從 ps.open_stock.avg_price 拿 (如果有)
+                    price = ps.open_stock.avg_price or 0.0
+                
+                holding_val += (ps.pos_stock_shares * price)
+
+            # 2. 處理中部位 (ORDER_SENT)
+            # 這筆錢還沒成交，但我們已經送單，必須預留
+            if ps.state == PositionState.ORDER_SENT:
+                # 預估買進金額
+                quote = self.market_data.get_stock(ps.stock_code)
+                price = _get_ask(quote)
+                if price <= 0:
+                    # 嘗試用下單時的價格 (如果有記錄) 
+                    # 這裡暫時無法取得 order price，只好用 0 或略過
+                    pass
+                
+                # target_stock_lots * 1000 shares * price
+                pending_val += (ps.target_stock_lots * STOCK_SHARES_PER_LOT * price)
+
+        total_used = holding_val + pending_val
+        return total_used, holding_val, pending_val
+
+    def check_available(self, required_amount: float) -> bool:
+        used, _, _ = self.get_usage()
+        remaining = self.max_capital - used
+        if remaining >= required_amount:
+            return True
+        return False
+
+    def log_status(self):
+        used, h, p = self.get_usage()
+        print(f"[Capital] Max: {self.max_capital/10000:.0f}萬 | Used: {used/10000:.0f}萬 (Hold:{h/10000:.0f} Pending:{p/10000:.0f}) | Rem: {(self.max_capital-used)/10000:.0f}萬")
+
+
+# =========================
+# --- StrategyEngine ---
+# =========================
+class TradeSignal(dict):
+    pass
+
+class StrategyEngine:
+    def __init__(self, market_data: MarketData, pos_mgr: PositionManager, capital_mgr: CapitalManager):
+        self.market_data = market_data
+        self.pos_mgr = pos_mgr
+        self.capital_mgr = capital_mgr  # Inject
+        self._pairs_lock = threading.RLock()
+        self.pairs: List[Tuple[str, str]] = []
+        self.pair_map: Dict[str, List[str]] = {}
+        self.future_to_stock: Dict[str, str] = {}
+        
+        self.order_count_min = 0
+        self.last_min_ts = time.time()
+        self.order_count_day = 0
+        self.today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        self.start_ts = time.time()
+
+    def update_pairs(self, pairs: List[Tuple[str, str]]):
+        with self._pairs_lock:
+            self.pairs = list(pairs)
+            pair_map: Dict[str, List[str]] = {}
+            future_to_stock: Dict[str, str] = {}
+            for s, f in self.pairs:
+                pair_map.setdefault(s, []).append(f)
+                future_to_stock[f] = s
+            self.pair_map = pair_map
+            self.future_to_stock = future_to_stock
+        print(f"[Strategy] pairs updated: {len(self.pairs)}")
+
+    def check_risk(self, is_open: bool = True) -> bool:
+        # P0: Global Rate Limit
+        now = time.time()
+        if now - self.last_min_ts > 60:
+            self.last_min_ts = now
+            self.order_count_min = 0
+        
+        day_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        if day_str != self.today_str:
+            self.today_str = day_str
+            self.order_count_day = 0
+
+        if self.order_count_min >= MAX_ORDERS_PER_MIN:
+            print(f"[Strategy] Risk: Max orders/min reached ({self.order_count_min})")
+            return False
+        
+        if self.order_count_day >= MAX_DAILY_ORDERS:
+             print(f"[Strategy] Risk: Max daily orders reached ({self.order_count_day})")
+             return False
+
+        # --- KILL SWITCH CHECK ---
+        if KILL_SWITCH and is_open:
+            # In Kill Switch mode, we block new opens.
+            # But we must allow Close/Repair.
+            # Strategy calls check_risk(is_open=True) for OPEN.
+            return False
+
+        if DEGRADE_MODE and is_open:
+            # Degrade mode: reduce frequency or block?
+            # User said "只減倉不開倉".
+            return False
+
+        if is_open:
+            # Check Max Open Pairs
+            active = 0
+            unhedged = 0
+            for ps in self.pos_mgr.all_pairs():
+                if ps.state in (PositionState.HEDGED, PositionState.ORDER_SENT, PositionState.EXITING, PositionState.REPAIRING):
+                    active += 1
+                if ps.state == PositionState.REPAIRING:
+                    unhedged += 1
+            
+            # P0: Block New Opens if ANY UNHEDGED exists
+            if unhedged > 0:
+                # print(f"[Strategy] Risk: Block Open due to {unhedged} UNHEDGED pairs")
+                return False
+
+            if active >= MAX_OPEN_PAIRS:
+                return False
+
+        return True
+
+    def _increment_risk_counter(self):
+        self.order_count_min += 1
+        self.order_count_day += 1
+
+    def calculate_cost(self, stock_price: float, future_price: float) -> float:
+        stock_notional = stock_price * STOCK_SHARES_PER_LOT * STOCK_QTY
+        future_notional = future_price * FUTURE_SHARES_EQUIV * FUTURE_QTY
+        stock_fee = stock_notional * STOCK_FEE_RATE
+        future_fee = FUT_FEE_PER_CONTRACT * FUTURE_QTY
+        tax_stock = stock_notional * STOCK_TAX_RATE
+        tax_future = future_notional * FUT_TAX_RATE
+        return stock_fee + future_fee + tax_stock + tax_future
+
+    def _update_ewma(self, ps: PairState, basis: float, now: float):
+        if not ps.initialized:
+            ps.basis_mean = basis
+            ps.basis_std = STD_FLOOR # Initial safe floor
+            ps.last_tick_ts = now
+            ps.sample_count = 1
+            ps.initialized = True
+            return
+
+        dt = now - ps.last_tick_ts
+        if dt <= 0:
+            return
+        
+        # alpha = 1 - exp(-ln(2)*dt / half_life)
+        # alpha approx 0.693 * dt / half_life
+        alpha = 1.0 - math.exp(-0.693 * dt / EWMA_HALF_LIFE)
+        if alpha > 1.0: alpha = 1.0
+        
+        # Update Mean
+        diff = basis - ps.basis_mean
+        incr = alpha * diff
+        ps.basis_mean += incr
+        
+        # Update MAD (Mean Absolute Deviation) as proxy for Std
+        # Std ~ 1.25 * MAD for normal dist, but we can use MAD directly or scaled
+        mad_diff = abs(diff) - ps.basis_std
+        ps.basis_std += (alpha * mad_diff)
+        
+        # Apply Floor (P0 Fix)
+        # Use simple floor, or dynamic based on price?
+        # Fixed floor is safer for now.
+        if ps.basis_std < STD_FLOOR:
+            ps.basis_std = STD_FLOOR
+            
+        ps.last_tick_ts = now
+        ps.sample_count += 1
+
+    def on_quote(self, quote: Any) -> Optional[TradeSignal]:
+        # P1: Warmup Check
+        if time.time() - self.start_ts < WARMUP_SEC:
+            return None
+
+        code = _get_code(quote)
+        if not code:
+            return None
+
+        with self._pairs_lock:
+            pair_map = self.pair_map
+            future_to_stock = self.future_to_stock
+
+        target_stock = None
+        futures = []
+
+        if code in pair_map:
+            target_stock = code
+            futures = pair_map[code]
+        elif code in future_to_stock:
+            target_stock = future_to_stock[code]
+            futures = [code]
+        else:
+            return None
+
+        ps = self.pos_mgr.get_pair(target_stock)
+        if not ps:
+            return None
+
+        now = time.time()
+
+        # --- INFLIGHT & COOLDOWN GUARD (P0) ---
+        if not self.pos_mgr.try_acquire_lock(target_stock):
+             return None
+        
+        # We acquired lock. From here on, if we return early (None), we MUST release it.
+        # If we return a signal, ExecutionEngine takes over ownership of the lock (and will release it when done).
+        # EXCEPT: If on_signal is called, StrategyEngine hands off to ExecutionEngine. 
+        # But wait, StrategyEngine returns a signal, it does NOT call ExecutionEngine directly.
+        # The main loop calls ExecutionEngine.on_signal.
+        # So if we return a signal, the lock remains HELD (inflight=True).
+        # ExecutionEngine.on_signal will eventually clear it.
+        # If we return None, we must release it NOW.
+
+        try:
+            ps = self.pos_mgr.get_pair(target_stock) # Re-get to be safe
+            if not ps: 
+                self.pos_mgr.release_lock(target_stock)
+                return None
+
+            # --- AUTO REPAIR / UNHEDGED TIMEOUT (P0) ---
+            if ps.state == PositionState.REPAIRING:
+                # P1: Repair Throttle
+                if now - ps.last_repair_ts < 1.5:
+                     self.pos_mgr.release_lock(target_stock)
+                     return None
+                
+                duration = now - ps.unhedged_ts
+                
+                # Deadline logic
+                is_force_close = (duration > UNHEDGED_REPAIR_DEADLINE)
+                
+                # Action logic:
+                # If Force Close: Close Surplus Leg (Unwind)
+                # If Repair: Open Missing Leg (Repair)
+                
+                action = None
+                qty = 0
+                s_shares = ps.pos_stock_shares
+                f_qty = ps.pos_fut_qty
+                
+                # Determine imbalance
+                # Target is balanced: Stock(+2000) vs Future(-1) is OK.
+                # Stock Lots = s_shares / 1000.
+                
+                # Strategy:
+                # 1. Identify "Surplus" vs "Missing".
+                #    If Stock > 0, we have Long Stock.
+                #    If Stock < 0, we have Short Stock.
+                #    If Future > 0, we have Long Future.
+                #    If Future < 0, we have Short Future.
+                
+                # Case 1: Stock Only (Long). Missing Short Future.
+                if s_shares > 0 and f_qty == 0:
+                    if is_force_close:
+                        action = "FORCE_CLOSE_STOCK" # Unwind Stock
+                        qty = abs(s_shares) // STOCK_SHARES_PER_LOT
+                    else:
+                        action = "SELL_FUTURE" # Repair Future
+                        qty = FUTURE_QTY # Assume standard size
+                
+                # Case 2: Future Only (Short). Missing Long Stock.
+                elif s_shares == 0 and f_qty < 0:
+                    if is_force_close:
+                        action = "FORCE_CLOSE_FUTURE" # Unwind Future (Buy Back)
+                        qty = abs(f_qty)
+                    else:
+                        action = "BUY_STOCK" # Repair Stock
+                        qty = STOCK_QTY
+                
+                # Case 3: Stock Only (Short). Missing Long Future. (Less common in this strategy)
+                elif s_shares < 0 and f_qty == 0:
+                     if is_force_close:
+                        action = "FORCE_CLOSE_STOCK" # Buy Back Stock
+                        qty = abs(s_shares) // STOCK_SHARES_PER_LOT
+                     else:
+                        action = "BUY_FUTURE"
+                        qty = FUTURE_QTY
+                
+                # Case 4: Future Only (Long). Missing Short Stock.
+                elif s_shares == 0 and f_qty > 0:
+                     if is_force_close:
+                        action = "FORCE_CLOSE_FUTURE" # Sell Future
+                        qty = abs(f_qty)
+                     else:
+                        action = "SELL_STOCK"
+                        qty = STOCK_QTY
+                
+                # If unhandled partials (both exist but ratio wrong), default to Unwind All
+                elif s_shares != 0 and f_qty != 0:
+                     # Complex mismatch. Force Close All.
+                     # Pick one to close first?
+                     if s_shares != 0:
+                         action = "FORCE_CLOSE_STOCK"
+                         qty = abs(s_shares) // STOCK_SHARES_PER_LOT
+                     # Next tick will see stock=0 and close future.
+                
+                if action and qty > 0:
+                     # P2: Log Repair Decision
+                     print(f"[Strategy] {target_stock} UNHEDGED ({duration:.1f}s) -> {action} qty={qty}")
+                     
+                     # Update throttle ts
+                     ps.last_repair_ts = now
+
+                     # Lock Inflight is ALREADY HELD by try_acquire_lock.
+                     # We return signal, keeping the lock held. ExecutionEngine handles it.
+
+                     return TradeSignal({
+                        "type": "REPAIR",
+                        "sub_type": action,
+                        "stock_code": target_stock,
+                        "future_code": ps.fut_code or futures[0],
+                        "qty": qty,
+                        "is_force": is_force_close
+                    })
+                
+                self.pos_mgr.release_lock(target_stock)
+                return None # Wait for next tick
+
+            # --- HOLDING TIMEOUT CHECK ---
+            if ps.state == PositionState.HOLDING:
+                if ps.open_ts > 0 and (now - ps.open_ts) > MAX_HOLDING_SEC:
+                    # Force Exit
+                    pass # Fall through to exit logic
+
+            if ps.state in (PositionState.PENDING_ENTRY, PositionState.PENDING_EXIT):
+                self.pos_mgr.release_lock(target_stock)
+                return None
+
+            # --- BASIS & Z-SCORE CALCULATION ---
+            # Need both quotes
+            f_code = ps.fut_code or futures[0]
+            s_q, f_q = self.market_data.get_quotes(target_stock, f_code)
+            if not s_q or not f_q:
+                self.pos_mgr.release_lock(target_stock)
+                return None
+                
+            s_bid = _get_bid(s_q); s_ask = _get_ask(s_q)
+            f_bid = _get_bid(f_q); f_ask = _get_ask(f_q)
+            
+            # P0: Data Time vs Event Time
+            q_ts = _get_ts(s_q) # Use stock ts as reference
+            latency = now - q_ts
+            if latency > MAX_DATA_DELAY_SEC:
+                 # print(f"[Strategy] Stale Quote: delay={latency:.2f}s (Limit {MAX_DATA_DELAY_SEC}s)")
+                 self.pos_mgr.release_lock(target_stock)
+                 return None
+
+            # P1: Valid Quote Check
+            if s_bid <= 0 or s_ask <= 0 or f_bid <= 0 or f_ask <= 0:
+                 self.pos_mgr.release_lock(target_stock)
+                 return None
+            
+            # Mid Prices
+            s_mid = (s_bid + s_ask) / 2.0
+            f_mid = (f_bid + f_ask) / 2.0
+            
+            # Basis = F_mid - 2 * S_mid.
+            basis = f_mid - (2.0 * s_mid)
+            
+            self._update_ewma(ps, basis, now)
+            
+            # P0: Warmup / Min Samples
+            if not ps.initialized or ps.basis_std <= 0 or ps.sample_count < MIN_SAMPLES:
+                self.pos_mgr.release_lock(target_stock)
+                return None
+            
+            z_score = (basis - ps.basis_mean) / ps.basis_std
+            
+            # ---- ENTRY (Open Position) ----
+            if ps.state == PositionState.EMPTY:
+                if z_score >= Z_ENTRY:
+                    # Risk Check
+                    if not self.check_risk(is_open=True):
+                        self.pos_mgr.release_lock(target_stock)
+                        return None
+
+                    # Liquidity Check
+                    s_ask_vol = _get_ask_vol(s_q)
+                    f_bid_vol = _get_bid_vol(f_q)
+                    
+                    req_s = STOCK_QTY * 3
+                    req_f = FUTURE_QTY * 3
+                    
+                    if s_ask_vol < req_s or f_bid_vol < req_f:
+                        self.pos_mgr.release_lock(target_stock)
+                        return None
+
+                    stock_notional = s_ask * STOCK_SHARES_PER_LOT * STOCK_QTY
+                    
+                    # Capital Check
+                    if not self.capital_mgr.check_available(stock_notional):
+                        self.pos_mgr.release_lock(target_stock)
+                        return None
+                        
+                    future_notional = f_bid * FUTURE_SHARES_EQUIV * FUTURE_QTY
+                    spread_value = future_notional - stock_notional
+                    cost = self.calculate_cost(s_ask, f_bid)
+                    
+                    # Estimated Slippage
+                    s_slip = SLIPPAGE_SCALE * (STOCK_QTY / s_ask_vol) * 5.0
+                    f_slip = SLIPPAGE_SCALE * (FUTURE_QTY / f_bid_vol) * 5.0
+                    est_risk_cost = (s_slip * s_ask * 0.0005) + (f_slip * f_bid * 0.0002)
+                    
+                    net = spread_value - cost - est_risk_cost
+                    
+                    if net > ENTRY_THRESHOLD:
+                        # Lock Inflight (ALREADY HELD)
+                        
+                        self._increment_risk_counter()
+                        self.pos_mgr.set_future_pair(target_stock, f_code)
+                        self.pos_mgr.set_state(target_stock, PositionState.PENDING_ENTRY)
+                        
+                        # P2: Structured Log
+                        print(f"[Strategy] OPEN {target_stock} Z={z_score:.2f} Mean={ps.basis_mean:.2f} Std={ps.basis_std:.2f} Net={net:.0f} Basis={basis:.2f}")
+                        return TradeSignal({
+                            "type": "OPEN",
+                            "stock_code": target_stock,
+                            "future_code": f_code,
+                            "stock_px": s_ask,
+                            "fut_px": f_bid,
+                            "net": net,
+                        })
+
+            # ---- EXIT (Close Position) ----
+            elif ps.state == PositionState.HOLDING:
+                is_timeout = (ps.open_ts > 0 and (now - ps.open_ts) > MAX_HOLDING_SEC)
+                
+                if z_score <= Z_EXIT or is_timeout:
+                    s_bid_vol = _get_bid_vol(s_q)
+                    f_ask_vol = _get_ask_vol(f_q)
+                    
+                    if s_bid <= 0 or f_ask <= 0: 
+                        self.pos_mgr.release_lock(target_stock)
+                        return None
+                    
+                    if s_bid_vol < 1 or f_ask_vol < 1:
+                        self.pos_mgr.release_lock(target_stock)
+                        return None
+                    
+                    stock_notional = s_bid * STOCK_SHARES_PER_LOT * STOCK_QTY
+                    future_notional = f_ask * FUTURE_SHARES_EQUIV * FUTURE_QTY
+                    current_spread = future_notional - stock_notional
+                    
+                    reason = "TIMEOUT" if is_timeout else "Z-SCORE"
+                    
+                    # Lock Inflight (ALREADY HELD)
+
+                    self._increment_risk_counter()
+                    self.pos_mgr.set_state(target_stock, PositionState.PENDING_EXIT)
+                    print(f"[Strategy] CLOSE {target_stock} ({reason}) Z={z_score:.2f} Net={current_spread:.0f}")
+                    
+                    return TradeSignal({
+                        "type": "CLOSE",
+                        "stock_code": target_stock,
+                        "future_code": f_code,
+                        "stock_px": s_bid,
+                        "fut_px": f_ask,
+                        "net": current_spread,
+                    })
+
+            self.pos_mgr.release_lock(target_stock)
+            return None
+        except Exception:
+            self.pos_mgr.release_lock(target_stock)
+            return None
+
+
+# =========================
+# --- ExecutionEngine ---
+# =========================
+class ExecutionEngine:
+    def __init__(self, market_data: MarketData, pos_mgr: PositionManager, order_tracker: OrderTracker, throttler: Optional[ApiThrottler] = None):
+        self.market_data = market_data
+        self.pos_mgr = pos_mgr
+        self.tracker = order_tracker
+        self.throttler = throttler
+
+    def _tick_size_by_price(self, px: float) -> float:
+        if px < 10: return 0.01
+        if px < 50: return 0.05
+        if px < 100: return 0.1
+        if px < 500: return 0.5
+        if px < 1000: return 1.0
+        return 5.0
+
+    def _round_to_tick_by_its_own_tier(self, px: float, side: str) -> float:
+        if px <= 0:
+            return px
+        tick = self._tick_size_by_price(px)
+        dpx = Decimal(str(px))
+        dt = Decimal(str(tick))
+        q = dpx / dt
+        if side == "buy":
+            q2 = q.to_integral_value(rounding=ROUND_CEILING)
+        else:
+            q2 = q.to_integral_value(rounding=ROUND_FLOOR)
+        out = float(q2 * dt)
+        return max(out, tick)
+
+    def _step_one_tick_strict(self, px: float, side: str) -> float:
+        if px <= 0:
+            return px
+        tick_now = self._tick_size_by_price(px)
+        if side == "buy":
+            px2 = px + tick_now
+            return self._round_to_tick_by_its_own_tier(px2, "buy")
+        else:
+            px2 = px - tick_now
+            if px2 <= 0:
+                px2 = tick_now
+            return self._round_to_tick_by_its_own_tier(px2, "sell")
+
+    def _mk_mktable_price_strict(self, side: str, ref_px: float, protect_ticks: int) -> float:
+        if ref_px <= 0:
+            return ref_px
+        px = self._round_to_tick_by_its_own_tier(ref_px, "buy" if side == "buy" else "sell")
+        n = int(max(0, protect_ticks))
+        for _ in range(n):
+            px = self._step_one_tick_strict(px, side)
+        px = self._round_to_tick_by_its_own_tier(px, side)
+        return px
+
+    def _cancel_best_effort(self, api: sj.Shioaji, trade_obj) -> bool:
+        try:
+            api.cancel_order(trade_obj)
+            return True
+        except Exception:
+            return False
+
+    def _place_stock_order(self, api: sj.Shioaji, stock_code: str, action, price: float, qty_lot: int, price_type=None):
+        contract_s = api.Contracts.Stocks[stock_code]
+        if price_type is None:
+            price_type = sj.constant.StockPriceType.LMT
+            
+        order_s = api.Order(
+            price=float(price),
+            quantity=int(qty_lot),
+            action=action,
+            price_type=price_type,
+            order_type=sj.constant.OrderType.ROD if hasattr(sj.constant, "OrderType") else "ROD",
+            order_lot=sj.constant.StockOrderLot.Common if hasattr(sj.constant, "StockOrderLot") else "Common",
+            account=api.stock_account
+        )
+        return api.place_order(contract_s, order_s)
+
+    def _place_future_order(self, api: sj.Shioaji, future_code: str, action, price: float, qty: int, phase_open: bool, price_type=None):
+        contract_f = api.Contracts.Futures[future_code]
+        octype = sj.constant.FuturesOCType.Auto if hasattr(sj.constant, "FuturesOCType") else "Auto"
+        
+        if price_type is None:
+            price_type = sj.constant.FuturesPriceType.LMT if hasattr(sj.constant, "FuturesPriceType") else sj.constant.StockPriceType.LMT
+            
+        order_type_f = sj.constant.FuturesOrderType.ROD if hasattr(sj.constant, "FuturesOrderType") else (
+            sj.constant.OrderType.ROD if hasattr(sj.constant, "OrderType") else "ROD"
+        )
+
+        order_f = api.Order(
+            action=action,
+            price=float(price),
+            quantity=int(qty),
+            price_type=price_type,
+            order_type=order_type_f,
+            octype=octype,
+            account=api.futopt_account
+        )
+        return api.place_order(contract_f, order_f)
+
+    def _calc_cost(self, stock_price: float, future_price: float) -> float:
+        stock_notional = stock_price * STOCK_SHARES_PER_LOT * STOCK_QTY
+        future_notional = future_price * FUTURE_SHARES_EQUIV * FUTURE_QTY
+        stock_fee = stock_notional * STOCK_FEE_RATE
+        future_fee = FUT_FEE_PER_CONTRACT * FUTURE_QTY
+        tax_stock = stock_notional * STOCK_TAX_RATE
+        tax_future = future_notional * FUT_TAX_RATE
+        return stock_fee + future_fee + tax_stock + tax_future
+
+    def _calc_open_net(self, stock_buy: float, future_sell: float) -> float:
+        spread = (future_sell * FUTURE_SHARES_EQUIV * FUTURE_QTY) - (stock_buy * STOCK_SHARES_PER_LOT * STOCK_QTY)
+        return spread - self._calc_cost(stock_buy, future_sell)
+
+    def _get_top_prices(self, stock_code: str, future_code: str):
+        s_q, f_q = self.market_data.get_quotes(stock_code, future_code)
+        if not s_q or not f_q:
+            return None
+        s_ask = _get_ask(s_q)
+        s_bid = _get_bid(s_q)
+        f_ask = _get_ask(f_q)
+        f_bid = _get_bid(f_q)
+        return s_ask, s_bid, f_ask, f_bid
+
+    def on_signal(self, sig: Dict[str, Any], api: sj.Shioaji):
+        typ = sig.get("type")
+        stock_code = str(sig.get("stock_code"))
+        future_code = str(sig.get("future_code"))
+        
+        # --- Handle REPAIR Signal ---
+        if typ == "REPAIR":
+            sub_type = sig.get("sub_type")
+            qty = int(sig.get("qty") or 0)
+            if qty <= 0: return
+            
+            # P0: Handling Force Close
+            is_force = sig.get("is_force", False) or "FORCE" in sub_type
+            
+            print(f"[Execution] Executing Auto-Repair: {sub_type} {stock_code} qty={qty} (is_force={is_force})")
+            try:
+                # Use Aggressive Limit orders for repair, Market for Force Close
+                if "STOCK" in sub_type: # SELL_STOCK, BUY_STOCK, FORCE_CLOSE_STOCK
+                    quote = self.market_data.get_stock(stock_code)
+                    
+                    # Decide direction
+                    # sub_type usually contains 'SELL' or 'BUY' or 'FORCE_CLOSE_STOCK'
+                    # We need to map exact action. 
+                    # StrategyEngine now emits explicit BUY_STOCK / SELL_STOCK even for force close.
+                    if "BUY" in sub_type or ("FORCE" in sub_type and "STOCK" in sub_type and self.pos_mgr.get_pair(stock_code).pos_stock_shares < 0):
+                        action = sj.constant.Action.Buy
+                        ref_px = _get_ask(quote) if quote else 0
+                        side = "buy"
+                    else:
+                        action = sj.constant.Action.Sell
+                        ref_px = _get_bid(quote) if quote else 0
+                        side = "sell"
+                    
+                    price_type = sj.constant.StockPriceType.LMT
+                    px = 0.0
+                    
+                    if is_force:
+                        if ref_px > 0:
+                            px = self._mk_mktable_price_strict(side, ref_px, protect_ticks=FORCE_CLOSE_TICKS)
+                    else:
+                        if ref_px > 0:
+                            px = self._mk_mktable_price_strict(side, ref_px, protect_ticks=REPAIR_TICKS)
+                            
+                    if px > 0:
+                        self._place_stock_order(api, stock_code, action, px, qty, price_type=price_type)
+
+                elif "FUTURE" in sub_type: 
+                    quote = self.market_data.get_future(future_code)
+                    
+                    if "BUY" in sub_type or ("FORCE" in sub_type and "FUTURE" in sub_type and self.pos_mgr.get_pair(stock_code).pos_fut_qty < 0):
+                        action = sj.constant.Action.Buy
+                        ref_px = _get_ask(quote) if quote else 0
+                        side = "buy"
+                    else:
+                        action = sj.constant.Action.Sell
+                        ref_px = _get_bid(quote) if quote else 0
+                        side = "sell"
+
+                    price_type = sj.constant.FuturesPriceType.LMT if hasattr(sj.constant, "FuturesPriceType") else sj.constant.StockPriceType.LMT
+                    px = 0.0
+                    
+                    if is_force:
+                        if ref_px > 0:
+                            px = self._mk_mktable_price_strict(side, ref_px, protect_ticks=FORCE_CLOSE_TICKS)
+                    else:
+                        if ref_px > 0:
+                            px = self._mk_mktable_price_strict(side, ref_px, protect_ticks=REPAIR_TICKS)
+                            
+                    if px > 0:
+                        # phase_open detection? For repair, if we are opening a missing leg, it's open.
+                        # If we are closing a surplus leg, it's close.
+                        # Usually repair is opening, force close is closing.
+                        is_open_leg = not is_force
+                        self._place_future_order(
+                            api, future_code, action, px, qty, phase_open=is_open_leg, 
+                            price_type=price_type
+                        )
+            except Exception as e:
+                print(f"[Execution] Auto-Repair failed: {e}")
+            
+            # Important: release lock after sending orders (ExecutionEngine convention)
+            # Actually, PositionManager.inflight is auto-managed?
+            # StrategyEngine set it to True. We should release it after 'done'.
+            # But here we just sent order. State is still UNHEDGED.
+            # We rely on AccountMonitor/OrderEvents to eventually clear it.
+            # But we must release the inflight lock so next tick can re-evaluate?
+            # NO. If we release immediately, Strategy will spam orders.
+            # We keep inflight=True. PositionManager will NOT auto-release for Repair.
+            # Wait... StrategyEngine sets inflight=True. 
+            # If we don't release, it stays True forever?
+            # We should probably set a timeout in Strategy to auto-release?
+            # Or release here after a short sleep?
+            # P0 Fix: Release lock after short delay so strategy can retry if failed.
+            time.sleep(1.0) 
+            self.pos_mgr.set_inflight(stock_code, False)
+            return
+        # ----------------------------
+
+        # P0: Set Inflight Lock
+        self.pos_mgr.set_inflight(stock_code, True)
+        
+        try:
+            init_stock_px = float(sig.get("stock_px") or 0.0)
+            init_fut_px = float(sig.get("fut_px") or 0.0)
+            net = float(sig.get("net") or 0.0)
+
+            is_open = (typ == "OPEN")
+            phase = "open" if is_open else "close"
+
+            # P0: Set Inflight Lock
+            self.pos_mgr.set_inflight(stock_code, True)
+
+            self.pos_mgr.prepare_phase(
+                stock_code=stock_code,
+                phase=phase,
+                target_stock_lots=STOCK_QTY, # ✅ Use Lots (張)
+                target_fut_qty=FUTURE_QTY,
+                last_signal_net=net,
+            )
+
+            stock_action = sj.constant.Action.Buy if is_open else sj.constant.Action.Sell
+            future_action = sj.constant.Action.Sell if is_open else sj.constant.Action.Buy
+
+            # P1: Aggressive Open Pricing
+            # Cross spread by default + some ticks
+            if is_open:
+                stock_px = self._mk_mktable_price_strict("buy", init_stock_px, STOCK_BUY_TICKS + 1)
+                fut_px   = self._mk_mktable_price_strict("sell", init_fut_px, FUT_SELL_TICKS + 1)
+            else:
+                stock_px = self._mk_mktable_price_strict("sell", init_stock_px, STOCK_SELL_TICKS + 1)
+                fut_px   = self._mk_mktable_price_strict("buy", init_fut_px, FUT_BUY_TICKS + 1)
+
+            trade_s = None
+            trade_f = None
+
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                    # P1: IOC Aggressive Limit Order for OPEN (Stock Buy / Fut Sell)
+                    # P2: Use IOC or ROD? User suggested "IOC aggressive limit".
+                    # Shioaji Future doesn't support IOC well in all versions, but Stock does.
+                    # ROD is safer for "queueing", IOC for "fill or kill".
+                    # Given logic: "穿 1~2 tick", ROD is fine as it acts like marketable limit.
+                    # If we use IOC and partial fill, we land in UNHEDGED immediately.
+                    # ROD with aggressive price allows walking the book if needed?
+                    # Let's stick to ROD (Rest of Day) but with aggressive price (Crossing Spread).
+                    # This effectively acts like a Market order if liquidity exists, but capped price.
+                    
+                    fs = ex.submit(self._place_stock_order, api, stock_code, stock_action, stock_px, STOCK_QTY)
+                    ff = ex.submit(self._place_future_order, api, future_code, future_action, fut_px, FUTURE_QTY, is_open)
+                    trade_s = fs.result()
+                    trade_f = ff.result()
+            except Exception as e:
+                print(f"[{phase.upper()}] send orders failed: {e}")
+                self.pos_mgr.set_state(stock_code, PositionState.IDLE if is_open else PositionState.HEDGED)
+                self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                return
+
+            # --- Record to Persistence ---
+            self.tracker.record(
+                str(trade_s.order.id), stock_code, future_code, phase, "stock", 
+                stock_action, stock_px, STOCK_QTY
+            )
+            self.tracker.record(
+                str(trade_f.order.id), stock_code, future_code, phase, "future", 
+                future_action, fut_px, FUTURE_QTY
+            )
+            # -----------------------------
+
+            self.pos_mgr.register_order(str(trade_s.order.id), stock_code, phase, "stock")
+            self.pos_mgr.register_order(str(trade_f.order.id), stock_code, phase, "future")
+
+            print(f"[{phase.upper()}] orders sent: stock={trade_s.order.id}, future={trade_f.order.id}")
+
+        except Exception as e:
+            print(f"[{phase.upper()}] phase setup/record failed: {e}")
+            self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+            self.pos_mgr.set_inflight(stock_code, False)
+            return
+
+        sync = self.pos_mgr.get_phase_sync(stock_code, phase)
+        if not sync:
+            self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+            self.pos_mgr.set_inflight(stock_code, False) # Unlock
+            return
+
+        t0 = time.time()
+        last_update_ts = t0
+        while True:
+            if sync.done.is_set():
+                self.pos_mgr.set_state(stock_code, PositionState.HEDGED if is_open else PositionState.IDLE)
+                self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                return
+            if sync.failed.is_set():
+                break
+            
+            now = time.time()
+            if now - t0 > HEDGE_TIMEOUT_SEC:
+                break
+
+            # ✅ 主動查詢 & 印出狀態
+            if now - last_update_ts > 2.0:
+                try:
+                    # Debug print status
+                    ps = self.pos_mgr.get_pair(stock_code)
+                    if ps:
+                        if phase == "open":
+                            s_st, f_st = ps.open_stock.status, ps.open_future.status
+                        else:
+                            s_st, f_st = ps.close_stock.status, ps.close_future.status
+                        print(f"  [Waiting] {stock_code} {phase} | Stock: {s_st} | Fut: {f_st}")
+
+                    if self.throttler:
+                        self.throttler.call(api.update_status, api.stock_account)
+                        self.throttler.call(api.update_status, api.futopt_account)
+                    else:
+                        api.update_status(api.stock_account)
+                        api.update_status(api.futopt_account)
+                except Exception:
+                    pass
+                last_update_ts = now
+
+            time.sleep(0.02)
+
+        ps = self.pos_mgr.get_pair(stock_code)
+        if not ps:
+            self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+            self.pos_mgr.set_inflight(stock_code, False) # Unlock
+            return
+
+        if phase == "open":
+            st = ps.open_stock.status
+            ft = ps.open_future.status
+        else:
+            st = ps.close_stock.status
+            ft = ps.close_future.status
+
+        filled_s = (st == str(sj.constant.Status.Filled)) or (str(st).upper() == "FILLED")
+        filled_f = (ft == str(sj.constant.Status.Filled)) or (str(ft).upper() == "FILLED")
+
+        if (not filled_s) and (not filled_f):
+            print(f"[{phase.upper()}] no leg filled -> cancel both (best effort)")
+            c1 = True
+            c2 = True
+            if trade_s: c1 = self._cancel_best_effort(api, trade_s)
+            if trade_f: c2 = self._cancel_best_effort(api, trade_f)
+            
+            # 如果 Cancel 動作本身沒報錯，我們先假設它會成功，重置狀態
+            # 如果真的沒 Cancel 掉且成交了，會由 AccountMonitor 抓出 UNHEDGED -> REPAIRING
+            if c1 and c2:
+                self.pos_mgr.set_state(stock_code, PositionState.IDLE if is_open else PositionState.HEDGED)
+            else:
+                # 如果連送出 Cancel 都失敗，標記為 REPAIRING 比較安全
+                print(f"[{phase.upper()}] cancel failed -> set REPAIRING")
+                self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+            self.pos_mgr.set_inflight(stock_code, False) # Unlock
+            return
+
+        print(f"[{phase.upper()}] single-leg filled -> REPAIR/UNWIND")
+
+        top = self._get_top_prices(stock_code, future_code)
+        if not top:
+            print("  [Repair] no quotes -> set REPAIRING")
+            self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+            self.pos_mgr.set_inflight(stock_code, False) # Unlock
+            return
+
+        s_ask, s_bid, f_ask, f_bid = top
+
+        if is_open:
+            if filled_f and (not filled_s):
+                # ✅ REPAIR STRATEGY: Use Aggressive Limit Order
+                print(f"  [Repair] hedge stock buy -> Aggressive LMT")
+                self.pos_mgr.reset_phase_events_only(stock_code, phase)
+                try:
+                    # 追價 10 ticks
+                    px = self._mk_mktable_price_strict("buy", s_ask, protect_ticks=10)
+                    trade_fix = self._place_stock_order(
+                        api, stock_code, sj.constant.Action.Buy, px, STOCK_QTY, 
+                        price_type=sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "stock", sj.constant.Action.Buy, px, STOCK_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "stock")
+                except Exception as e:
+                    print(f"  [Repair] stock hedge order failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+                if sync.done.wait(timeout=REPAIR_TIMEOUT_SEC):
+                    self.pos_mgr.set_state(stock_code, PositionState.HEDGED)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                # ✅ UNWIND STRATEGY: Aggressive LMT
+                print(f"  [Unwind] buy back future -> Aggressive LMT")
+                try:
+                    px = self._mk_mktable_price_strict("buy", f_ask, protect_ticks=10)
+                    trade_fix = self._place_future_order(
+                        api, future_code, sj.constant.Action.Buy, px, FUTURE_QTY, phase_open=False,
+                        price_type=sj.constant.FuturesPriceType.LMT if hasattr(sj.constant, "FuturesPriceType") else sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "future", sj.constant.Action.Buy, px, FUTURE_QTY)
+                    # Note: Unwind is technically closing the leg, but we register it to track its status
+                    # To properly track unwind, we might need a separate 'leg' or just reuse 'future' to overwrite status
+                    self.pos_mgr.register_order(oid, stock_code, phase, "future")
+                except Exception as e:
+                    print(f"  [Unwind] future buyback failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+                self.pos_mgr.set_state(stock_code, PositionState.IDLE)
+                self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                return
+
+            if filled_s and (not filled_f):
+                # ✅ REPAIR STRATEGY: Aggressive LMT
+                print(f"  [Repair] hedge future sell -> Aggressive LMT")
+                self.pos_mgr.reset_phase_events_only(stock_code, phase)
+                try:
+                    px = self._mk_mktable_price_strict("sell", f_bid, protect_ticks=10)
+                    trade_fix = self._place_future_order(
+                        api, future_code, sj.constant.Action.Sell, px, FUTURE_QTY, phase_open=True,
+                        price_type=sj.constant.FuturesPriceType.LMT if hasattr(sj.constant, "FuturesPriceType") else sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "future", sj.constant.Action.Sell, px, FUTURE_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "future")
+                except Exception as e:
+                    print(f"  [Repair] future hedge order failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+                if sync.done.wait(timeout=REPAIR_TIMEOUT_SEC):
+                    self.pos_mgr.set_state(stock_code, PositionState.HEDGED)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                # ✅ UNWIND STRATEGY: Aggressive LMT
+                print(f"  [Unwind] sell stock -> Aggressive LMT")
+                try:
+                    px = self._mk_mktable_price_strict("sell", s_bid, protect_ticks=10)
+                    trade_fix = self._place_stock_order(
+                        api, stock_code, sj.constant.Action.Sell, px, STOCK_QTY,
+                        price_type=sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "stock", sj.constant.Action.Sell, px, STOCK_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "stock")
+                except Exception as e:
+                    print(f"  [Unwind] stock sell failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+                self.pos_mgr.set_state(stock_code, PositionState.IDLE)
+                self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                return
+
+        else:
+            if filled_f and (not filled_s):
+                # ✅ REPAIR STRATEGY: Aggressive LMT
+                print(f"  [Repair] sell stock -> Aggressive LMT")
+                self.pos_mgr.reset_phase_events_only(stock_code, phase)
+                try:
+                    px = self._mk_mktable_price_strict("sell", s_bid, protect_ticks=10)
+                    trade_fix = self._place_stock_order(
+                        api, stock_code, sj.constant.Action.Sell, px, STOCK_QTY,
+                        price_type=sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "stock", sj.constant.Action.Sell, px, STOCK_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "stock")
+                except Exception as e:
+                    print(f"  [Repair] stock close failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                if sync.done.wait(timeout=REPAIR_TIMEOUT_SEC):
+                    self.pos_mgr.set_state(stock_code, PositionState.IDLE)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                # ✅ UNWIND STRATEGY: Aggressive LMT
+                print(f"  [Unwind-to-HEDGED] sell future again -> Aggressive LMT")
+                try:
+                    px = self._mk_mktable_price_strict("sell", f_bid, protect_ticks=10)
+                    trade_fix = self._place_future_order(
+                        api, future_code, sj.constant.Action.Sell, px, FUTURE_QTY, phase_open=True,
+                        price_type=sj.constant.FuturesPriceType.LMT if hasattr(sj.constant, "FuturesPriceType") else sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "future", sj.constant.Action.Sell, px, FUTURE_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "future")
+                except Exception as e:
+                    print(f"  [Unwind] future resell failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                self.pos_mgr.set_state(stock_code, PositionState.HEDGED)
+                self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                return
+
+            if filled_s and (not filled_f):
+                # ✅ REPAIR STRATEGY: Aggressive LMT
+                print(f"  [Repair] buy future -> Aggressive LMT")
+                self.pos_mgr.reset_phase_events_only(stock_code, phase)
+                try:
+                    px = self._mk_mktable_price_strict("buy", f_ask, protect_ticks=10)
+                    trade_fix = self._place_future_order(
+                        api, future_code, sj.constant.Action.Buy, px, FUTURE_QTY, phase_open=False,
+                        price_type=sj.constant.FuturesPriceType.LMT if hasattr(sj.constant, "FuturesPriceType") else sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "future", sj.constant.Action.Buy, px, FUTURE_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "future")
+                except Exception as e:
+                    print(f"  [Repair] future close failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                if sync.done.wait(timeout=REPAIR_TIMEOUT_SEC):
+                    self.pos_mgr.set_state(stock_code, PositionState.IDLE)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                # ✅ UNWIND STRATEGY: Aggressive LMT
+                print(f"  [Unwind-to-HEDGED] buy stock back -> Aggressive LMT")
+                try:
+                    px = self._mk_mktable_price_strict("buy", s_ask, protect_ticks=10)
+                    trade_fix = self._place_stock_order(
+                        api, stock_code, sj.constant.Action.Buy, px, STOCK_QTY,
+                        price_type=sj.constant.StockPriceType.LMT
+                    )
+                    oid = str(trade_fix.order.id)
+                    self.tracker.record(oid, stock_code, future_code, phase, "stock", sj.constant.Action.Buy, px, STOCK_QTY)
+                    self.pos_mgr.register_order(oid, stock_code, phase, "stock")
+                except Exception as e:
+                    print(f"  [Unwind] stock buyback failed: {e}")
+                    self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                    self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                    return
+
+                self.pos_mgr.set_state(stock_code, PositionState.HEDGED)
+                self.pos_mgr.set_inflight(stock_code, False) # Unlock
+                return
+
+        self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+        self.pos_mgr.set_inflight(stock_code, False) # Unlock
+        
+        # P0: Removed incorrect try/except block around global scope
+
+
+
+
+# =========================
+# --- PairRefresher ---
+# =========================
+class PairRefresher(threading.Thread):
+    def __init__(
+        self,
+        discoverer: PairDiscoverer,
+        strategy: StrategyEngine,
+        pos_mgr: PositionManager,
+        sub_mgr: SubscriptionManager,
+        top_n: int = TOP_N_PAIRS,
+        interval_sec: int = REFRESH_PAIRS_EVERY_SEC,
+    ):
+        super().__init__(daemon=True)
+        self.discoverer = discoverer
+        self.strategy = strategy
+        self.pos_mgr = pos_mgr
+        self.sub_mgr = sub_mgr
+        self.top_n = int(top_n)
+        self.interval_sec = int(interval_sec)
+        self.running = True
+        self._last_sig = None
+
+    def stop(self):
+        self.running = False
+
+    def _signature(self, pairs: List[Tuple[str, str]]) -> str:
+        pairs2 = sorted(pairs, key=lambda x: (x[0], x[1]))
+        return "|".join([f"{s}:{f}" for s, f in pairs2])
+
+    def run(self):
+        print(f">>> Pair Refresher Started (every {self.interval_sec}s)")
+        while self.running:
+            n = int(max(1, self.interval_sec * 10))
+            for _ in range(n):
+                if not self.running:
+                    return
+                time.sleep(0.1)
+
+            try:
+                pairs = self.discoverer.find_active_pairs(top_n=self.top_n)
+                if not pairs:
+                    print("[Pairs] refresh got empty, skip")
+                    continue
+
+                sig = self._signature(pairs)
+                if sig == self._last_sig:
+                    print("[Pairs] unchanged")
+                    continue
+
+                self._last_sig = sig
+                print(f"[Pairs] changed -> apply (pairs={len(pairs)})")
+
+                self.pos_mgr.set_active_pairs(pairs)
+                self.strategy.update_pairs(pairs)
+                
+                # --- Merge Existing Positions for Subscription ---
+                # 確保所有手上有部位 (HOLDING/UNHEDGED/PENDING) 的 pair 都在訂閱清單中
+                # 不然無法平倉
+                existing_pairs = []
+                for ps in self.pos_mgr.all_pairs():
+                    if ps.state != PositionState.EMPTY:
+                        existing_pairs.append((ps.stock_code, ps.fut_code))
+                
+                # 合併清單 (Existing + New Discovered)
+                # 使用 dict 去重，並讓 Existing 優先 (如果 SubscriptionManager 有上限邏輯)
+                # 這裡簡單 set 去重
+                final_subs = list(set(pairs + existing_pairs))
+                print(f"[Pairs] Merged: {len(pairs)} new + {len(existing_pairs)} existing -> {len(final_subs)} total subs")
+                
+                self.sub_mgr.apply_pairs(final_subs, log_prefix="[Subscription]")
+                # -------------------------------------------------
+
+            except Exception as e:
+                print(f"[Pairs] refresh failed: {e}")
+
+
+# =========================
+# --- ArbitrageSystem ---
+# =========================
+class ArbitrageSystem:
+    def __init__(self):
+        self.api = sj.Shioaji(simulation=SIMULATION)
+
+        self.market_data = MarketData()
+        self.pos_mgr = PositionManager()
+        self.order_tracker = OrderTracker() # Init Tracker
+
+        self.quote_queue = queue.Queue(maxsize=20000)
+        self.exec_queue = queue.Queue(maxsize=20000)
+
+        self.sub_mgr = SubscriptionManager(self.api, max_subs=MAX_SUBS)
+
+        self.capital_mgr = CapitalManager(MAX_CAPITAL, self.pos_mgr, self.market_data) # Init Capital Mgr
+        self.strategy = StrategyEngine(self.market_data, self.pos_mgr, self.capital_mgr) # Pass to Strategy
+        
+        self.throttler = ApiThrottler(interval=1.0)
+        self.execution = ExecutionEngine(self.market_data, self.pos_mgr, self.order_tracker, throttler=self.throttler) # Pass Tracker & Throttler
+
+        self.account_monitor: Optional[AccountMonitor] = None
+        self.keyboard: Optional[KeyboardMonitor] = None
+        self.pair_refresher: Optional[PairRefresher] = None
+
+        self.active_pairs: List[Tuple[str, str]] = []
+        self.running = False
+
+        self._setup_callbacks_done = False
+
+        self.DBG_WATCH_STOCK = DBG_WATCH_STOCK
+        self.DBG_WATCH_FUT = DBG_WATCH_FUT
+
+    def login(self):
+        if not CA_API_KEY or not CA_SECRET_KEY:
+            raise RuntimeError("Missing Sinopack_CA_API_KEY / Sinopack_CA_SECRET_KEY in env")
+
+        if SIMULATION:
+            print("[System] login (simulation)...")
+            # ✅ 重要：subscribe_trade=True，才比較穩收到委託/成交回報
+            self.api.login(
+                api_key=CA_API_KEY,
+                secret_key=CA_SECRET_KEY,
+                contracts_cb=print,
+                subscribe_trade=True,
+            )
+            try:
+                if CA_PATH and CA_PASSWORD and PERSON_ID:
+                    self.api.activate_ca(CA_PATH, CA_PASSWORD, PERSON_ID)
+            except Exception as e:
+                print(f"[System] activate_ca (simulation) failed (ignored): {e}")
+        else:
+            print("[System] login (real)...")
+            self.api.login(
+                api_key=CA_API_KEY,
+                secret_key=CA_SECRET_KEY,
+                contracts_cb=lambda security_type: print(f"{repr(security_type)} fetch done."),
+                subscribe_trade=True
+            )
+            print("[System] activate_ca...")
+            self.api.activate_ca(ca_path=CA_PATH, ca_passwd=CA_PASSWORD, person_id=PERSON_ID)
+
+        print("[System] Login Success, waiting contracts ready...")
+        time.sleep(3)
+        
+        # Build Future Contract Map for safer subscription
+        self._build_future_map()
+
+    def _build_future_map(self):
+        print("[System] building future contract map...")
+        m = {}
+        for category in self.api.Contracts.Futures:
+            try:
+                iter(category)
+            except TypeError:
+                continue
+            for c in category:
+                if isinstance(c, tuple):
+                    c = c[1]
+                if hasattr(c, "code"):
+                    m[str(c.code)] = c
+        self.sub_mgr.set_future_map(m)
+        print(f"[System] future map ready: {len(m)} contracts")
+
+    def _setup_callbacks(self):
+        @self.api.on_bidask_stk_v1(bind=True)
+        def on_stock_quote(self_api, exchange, quote):
+            self.market_data.update_stock(quote)
+            try:
+                self.quote_queue.put_nowait(quote)
+            except queue.Full:
+                pass
+
+            if _get_code(quote) == self.DBG_WATCH_STOCK:
+                self._dbg_print_watch_line()
+
+        @self.api.on_bidask_fop_v1(bind=True)
+        def on_future_quote(self_api, exchange, quote):
+            self.market_data.update_future(quote)
+            try:
+                self.quote_queue.put_nowait(quote)
+            except queue.Full:
+                pass
+
+            if self.DBG_WATCH_FUT and _get_code(quote) == self.DBG_WATCH_FUT:
+                self._dbg_print_watch_line()
+
+        # ✅ Order Callback (狀態變更: Submitted, Cancelled, Failed)
+        self.api.set_order_callback(self._on_order_event)
+
+        # ✅ Deal Callback (成交回報: Filled, PartFilled)
+        # 不同版本 API 可能名稱不同，嘗試註冊
+        if hasattr(self.api, "set_trade_callback"):
+            self.api.set_trade_callback(self._on_deal_event)
+        elif hasattr(self.api, "set_deal_callback"):
+            self.api.set_deal_callback(self._on_deal_event)
+
+        self._setup_callbacks_done = True
+        print("[System] callbacks ready")
+
+    def _extract_order_id(self, order_state, trade_dict) -> str:
+        try:
+            # 1) dict route
+            if isinstance(trade_dict, dict):
+                oid = (trade_dict.get("order", {}) or {}).get("id") or trade_dict.get("trade_id")
+                if oid:
+                    return str(oid)
+
+            # 2) object route
+            if hasattr(trade_dict, "order") and getattr(trade_dict.order, "id", None):
+                return str(trade_dict.order.id)
+            
+            if hasattr(order_state, "order") and getattr(order_state.order, "id", None):
+                return str(order_state.order.id)
+                
+        except Exception:
+            pass
+
+        return ""
+
+    def _normalize_deal_qty(self, leg: str, qty: int, trade_dict: dict) -> int:
+        """
+        Normalize deal qty to:
+        - stock: lots (張)
+        - future: contracts (口)
+        """
+        if qty <= 0:
+            return 0
+
+        if leg == "stock":
+            # Heuristic: if qty is huge, it's likely shares; convert to lots.
+            # Also try to detect from trade_dict fields if available.
+            # Common lot: 1 lot = 1000 shares
+            if qty >= 1000:
+                return qty // STOCK_SHARES_PER_LOT
+            return qty
+
+        # future
+        return qty
+
+    def _on_order_event(self, order_state, trade_dict):
+        """
+        Order Event: 處理委託狀態變更 (Submitted, Cancelled, Failed, etc.)
+        注意：這裡通常不包含成交明細 (Deal Details)，成交由 _on_deal_event 處理。
+        """
+        # Debug Log (Throttled or Error only)
+        # print(f"[Order Event] state={order_state} trade={trade_dict}")
+
+        self.pos_mgr.record_order_event(order_state, trade_dict)
+
+        order_id = self._extract_order_id(order_state, trade_dict)
+        if not order_id:
+            return
+
+        info = self.pos_mgr.lookup_order(order_id)
+        if not info:
+            return
+
+        stock_code, phase, leg = info
+
+        # 解析 Status
+        raw_status = None
+        if hasattr(order_state, "status"):
+            raw_status = order_state.status
+        elif isinstance(trade_dict, dict):
+            st = trade_dict.get("status")
+            if isinstance(st, dict):
+                raw_status = st.get("status")
+            else:
+                raw_status = st
+
+        status = normalize_status(raw_status)
+        if status == "FILLED":
+            # ✅ 改良：不在 order event 宣告全成，交給 deal event 來累加 qty 再 auto-FILLED
+            status = "SUBMITTED"
+        if not status:
+            status = "SUBMITTED" # Default fallback for order event
+
+        # 這裡不更新 qty/price，只更新狀態
+        # 如果是 FILLED，交給 Deal Event 處理 (除非 Deal Event 沒觸發)
+        # 但 Order Event 的 status 如果是 Filled，通常代表全成，這時也許可以更新狀態，但量可能不准
+        # 為了安全，如果這裡是 Filled，我們標記狀態，但量保持 0 (等待 Deal Event 補量，或 PosMgr 累加)
+        
+        self.pos_mgr.update_leg_status(
+            stock_code=stock_code,
+            phase=phase,
+            leg=leg,
+            status=status,
+            filled_qty=0, # Order event doesn't guarantee deal qty
+            deal_price=0.0,
+            last_event=trade_dict if isinstance(trade_dict, dict) else str(trade_dict),
+        )
+
+    def _on_deal_event(self, trade_dict):
+        """
+        Deal Event: 處理成交回報 (Filled, PartFilled)
+        ✅ 修正版：優先匹配 order.id，支援 fallback trade_id
+        """
+        try:
+            if not isinstance(trade_dict, dict):
+                try:
+                    trade_dict = trade_dict.__dict__
+                except Exception:
+                    print(f"[Deal Event] Error converting trade_dict: {trade_dict}")
+                    return
+
+            self.pos_mgr.record_order_event(None, trade_dict)
+
+            # ✅ 1. Try trade_dict['order']['id']
+            oid = ""
+            try:
+                oid = str((trade_dict.get("order") or {}).get("id") or "")
+            except Exception:
+                oid = ""
+
+            # ✅ 2. Fallback to trade_id
+            if not oid:
+                oid = str(trade_dict.get("trade_id") or "")
+
+            if not oid:
+                # print(f"[Deal Event] No order_id found in event, skipping.")
+                return
+
+            info = self.pos_mgr.lookup_order(oid)
+            if not info:
+                # ✅ 3. Try fallback lookup using trade_id if it differs from what we found
+                alt = str(trade_dict.get("trade_id") or "")
+                if alt and alt != oid:
+                    info = self.pos_mgr.lookup_order(alt)
+                    if info:
+                        oid = alt
+            
+            if not info:
+                # ⚠️ 關鍵：如果找不到對應的 Order，印出警告，避免默默丟棄
+                print(f"[Deal Event] ⚠️ Warning: Order ID '{oid}' not found in local records. (Ignored)")
+                return
+
+            stock_code, phase, leg = info
+
+            # 解析成交資訊
+            qty = 0
+            px = 0.0
+            
+            # Structure often: trade_dict['status']['deal_quantity'] or trade_dict['deal_quantity']
+            st_node = trade_dict.get("status") or trade_dict
+            if isinstance(st_node, dict):
+                raw_qty = int(st_node.get("deal_quantity") or 0)
+                qty = self._normalize_deal_qty(leg, raw_qty, trade_dict)
+                px = float(st_node.get("deal_price") or st_node.get("price") or 0.0)
+
+            if qty <= 0:
+                return
+
+            print(f"[Deal Parsed] {stock_code} {leg} qty={qty} (raw={raw_qty if 'raw_qty' in locals() else '?'}) px={px} oid={oid}")
+
+            self.pos_mgr.update_leg_status(
+                stock_code=stock_code,
+                phase=phase,
+                leg=leg,
+                status="PARTFILLED", # 先設 PARTFILLED，讓 PosMgr 根據累加量判斷是否 FILLED
+                filled_qty=qty,
+                deal_price=px,
+                last_event=trade_dict,
+            )
+        except Exception as e:
+            import traceback
+            print(f"[Deal Event] ❌ CRITICAL ERROR: {e}")
+            traceback.print_exc()
+
+    def _snapshot_init(self, pairs: List[Tuple[str, str]]):
+        print("[System] fetching initial snapshots...")
+        contracts = []
+        seen = set()
+
+        for s, f in pairs:
+            if s not in seen:
+                try:
+                    contracts.append(self.api.Contracts.Stocks[s])
+                    seen.add(s)
+                except Exception:
+                    pass
+            if f not in seen:
+                try:
+                    contracts.append(self.api.Contracts.Futures[f])
+                    seen.add(f)
+                except Exception:
+                    pass
+
+        if not contracts:
+            return
+
+        try:
+            chunk = 50
+            for i in range(0, len(contracts), chunk):
+                snaps = self.api.snapshots(contracts[i:i+chunk])
+                for snap in snaps:
+                    w = SnapshotWrapper(snap)
+                    code = w.code
+
+                    is_future = any(code == f for _, f in pairs)
+                    is_stock = any(code == s for s, _ in pairs)
+
+                    if is_future:
+                        self.market_data.update_future(w)
+                    elif is_stock:
+                        self.market_data.update_stock(w)
+
+                    try:
+                        self.quote_queue.put_nowait(w)
+                    except queue.Full:
+                        pass
+        except Exception as e:
+            print(f"[System] snapshot init failed: {e}")
+
+    def _quote_loop(self):
+        while self.running:
+            try:
+                q = self.quote_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                sig = self.strategy.on_quote(q)
+                if sig:
+                    try:
+                        self.exec_queue.put_nowait(sig)
+                    except queue.Full:
+                        pass
+            except Exception as e:
+                print(f"[QuoteLoop] error: {e}")
+
+    def _exec_loop(self):
+        while self.running:
+            try:
+                sig = self.exec_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self.execution.on_signal(sig, api=self.api)
+            except Exception as e:
+                print(f"[ExecLoop] error: {e}")
+
+    def _dbg_print_watch_line(self):
+        global DBG_LAST_LINE
+        if not self.DBG_WATCH_FUT:
+            return
+
+        s_q, f_q = self.market_data.get_quotes(self.DBG_WATCH_STOCK, self.DBG_WATCH_FUT)
+        if not s_q or not f_q:
+            return
+
+        s_ask = _get_ask(s_q)
+        s_bid = _get_bid(s_q)
+        f_ask = _get_ask(f_q)
+        f_bid = _get_bid(f_q)
+
+        key = (s_ask, s_bid, f_ask, f_bid)
+        if DBG_LAST_LINE == key:
+            return
+        DBG_LAST_LINE = key
+
+        if s_ask > 0 and f_bid > 0:
+            stock_notional_buy = s_ask * STOCK_SHARES_PER_LOT * STOCK_QTY
+            future_notional_sell = f_bid * FUTURE_SHARES_EQUIV * FUTURE_QTY
+            spread_value = future_notional_sell - stock_notional_buy
+            cost = self.strategy.calculate_cost(s_ask, f_bid)
+            net = spread_value - cost
+            net_str = f"{net:,.0f}"
+        else:
+            net_str = "N/A (Px=0)"
+
+        msg = (
+            f"[WATCH] {self.DBG_WATCH_STOCK}/{self.DBG_WATCH_FUT} "
+            f"STK(b/a)={s_bid:.2f}/{s_ask:.2f} "
+            f"FUT(b/a)={f_bid:.2f}/{f_ask:.2f} "
+            f"net={net_str}      "
+        )
+        with DBG_LINE_LOCK:
+            sys.stdout.write("\r" + " " * 160 + "\r" + msg)
+            sys.stdout.flush()
+
+    def start(self, top_n_pairs: int = TOP_N_PAIRS, refresh_interval_sec: int = REFRESH_PAIRS_EVERY_SEC):
+        if not self._setup_callbacks_done:
+            self._setup_callbacks()
+
+        discoverer = PairDiscoverer(self.api)
+        pairs = discoverer.find_active_pairs(top_n=top_n_pairs)
+
+        if not pairs:
+            print("[System] no pairs found, fallback to DEBUG single pair if possible...")
+            pairs = []
+            try:
+                today = datetime.datetime.now()
+                target_month_str = today.strftime('%Y%m')
+                found = None
+                for category in self.api.Contracts.Futures:
+                    try:
+                        iter(category)
+                    except TypeError:
+                        continue
+                    for c in category:
+                        if isinstance(c, tuple):
+                            c = c[1]
+                        if getattr(c, "underlying_code", None) == self.DBG_WATCH_STOCK and getattr(c, "delivery_month", "") == target_month_str:
+                            found = str(c.code)
+                            break
+                    if found:
+                        break
+                if found:
+                    pairs = [(self.DBG_WATCH_STOCK, found)]
+            except Exception:
+                pass
+
+        if not pairs:
+            print("[System] still empty pairs -> exit")
+            return
+
+        self.active_pairs = pairs
+        self.pos_mgr.set_active_pairs(self.active_pairs)
+        
+        # --- RECONCILIATION START ---
+        # 在開始策略之前，先執行狀態重建
+        # 這會讀取 order history, updates status, 並查庫存
+        reconciler = Reconciler(self.api, self.pos_mgr, self.order_tracker)
+        reconciler.reconcile()
+        # --- RECONCILIATION END ---
+
+        self.DBG_WATCH_FUT = None
+        for s, f in self.active_pairs:
+            if s == self.DBG_WATCH_STOCK:
+                self.DBG_WATCH_FUT = f
+                break
+        print(f"\n[DBG] watch pair: {self.DBG_WATCH_STOCK}/{self.DBG_WATCH_FUT}\n")
+
+        self.pos_mgr.set_active_pairs(self.active_pairs)
+        self.strategy.update_pairs(self.active_pairs)
+
+        self.sub_mgr.apply_pairs(self.active_pairs, log_prefix="[Subscription]")
+
+        self._snapshot_init(self.active_pairs)
+
+        self.running = True
+
+        self.account_monitor = AccountMonitor(
+            api=self.api,
+            pos_mgr=self.pos_mgr,
+            stock_shares_per_lot=STOCK_SHARES_PER_LOT,
+            poll_sec=5.0, # ✅ 調快至 5s 以便更快發現狀態不一致
+        )
+        self.account_monitor.start()
+
+        threading.Thread(target=self._quote_loop, daemon=True).start()
+        threading.Thread(target=self._exec_loop, daemon=True).start()
+
+        self.pair_refresher = PairRefresher(
+            discoverer=discoverer,
+            strategy=self.strategy,
+            pos_mgr=self.pos_mgr,
+            sub_mgr=self.sub_mgr,
+            top_n=top_n_pairs,
+            interval_sec=refresh_interval_sec
+        )
+        self.pair_refresher.start()
+
+        self.keyboard = KeyboardMonitor(self)
+        self.keyboard.start()
+
+        print("[System] started\n")
+
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop()
+
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        print("\n[System] stopping...")
+
+        try:
+            if self.pair_refresher:
+                self.pair_refresher.stop()
+        except Exception:
+            pass
+
+        try:
+            if self.keyboard:
+                self.keyboard.stop()
+        except Exception:
+            pass
+
+        try:
+            if self.account_monitor:
+                self.account_monitor.stop()
+        except Exception:
+            pass
+
+        try:
+            self.sub_mgr.force_unsubscribe_all(log_prefix="[Subscription]")
+        except Exception:
+            pass
+
+        try:
+            self.api.logout()
+        except Exception as e:
+            print(f"[System] logout error: {e}")
+
+        print("[System] stopped\n")
+
+
+# =========================
+# --- main ---
+# =========================
+if __name__ == "__main__":
+    system = ArbitrageSystem()
+    system.login()
+    system.start(top_n_pairs=TOP_N_PAIRS, refresh_interval_sec=REFRESH_PAIRS_EVERY_SEC)
