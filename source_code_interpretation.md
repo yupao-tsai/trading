@@ -9,7 +9,7 @@
 1.  **Driver Layer**: `ExecutionEngine` (負責與 Shioaji API 溝通)
 2.  **Data Layer**: `MarketData` (負責維護行情報價快照)
 3.  **Strategy Layer**: `StrategyEngine` (純邏輯運算，計算價差與訊號，包含配對邏輯)
-4.  **Orchestration Layer**: `TransactionManager` (總指揮，協調資金、策略、交易與回報)
+4.  **Orchestration Layer**: `TransactionManager` (總指揮，協調資金、策略、交易與回報，包含非同步報價處理)
 5.  **State Layer**: `BaseTransaction` 及其子類 (負責單筆交易的生命週期管理)
 6.  **Presentation Layer**: `ArbitrageDashboard` (GUI) / `AccountReporter` (Console)
 7.  **Discovery Layer**: `PairDiscovery` (負責系統啟動時的掃描與配對)
@@ -57,7 +57,9 @@
     *   `reporter`: 負責產生報告文字 (`AccountReporter`)。
 *   **關鍵流程**:
     *   `run_step()`: Main Loop 每秒呼叫。
-    *   `_on_market_tick()`: 報價驅動策略。
+    *   `run_step()`: Main Loop 每秒呼叫。
+    *   `_on_market_tick()`: **[優化!]** 僅做為 Producer，將報價放入 Buffer。
+    *   `_quote_worker_loop()`: **[新!]** Consumer Thread，負責從 Buffer 取出報價並進行「合併 (Coalescing)」運算，解決快市延遲問題。
 
 ### E. PortfolioLedger (資金/庫存帳本)
 *   **用途**: 本地端的資金管理 (Capital Management)。
@@ -299,12 +301,22 @@ sequenceDiagram
     Note right of MD: Check Threshold (Size Gate)
     MD->>TM: _on_market_tick(code)
     
-    rect rgb(240, 248, 255)
-        Note right of TM: Fast Lookup
-        TM->>TM: _pair_map.get(code)
+    rect rgb(255, 248, 220)
+        Note right of TM: 1. Async Buffer (Producer)
+        TM->>TM: _pending_quote_codes.add(code)
+        TM->>TM: _quote_event.set()
     end
     
-    loop For Each Affected Pair
+    Note over TM: API Thread Released Immediately
+    
+    rect rgb(240, 248, 255)
+        Note right of TM: 2. Worker Thread (Consumer)
+        TM->>TM: _quote_worker_loop() wakes up
+        TM->>TM: Coalesce (De-duplicate) pending codes
+        TM->>TM: Find Unique Pairs map.get(code)
+    end
+
+    loop For Each Unique Pair
         TM->>Strat: on_tick(stock, future)
         Strat->>MD: get_snapshot()
         Strat->>Strat: calc Z-Score
