@@ -82,7 +82,47 @@
     *   確保系統能支援各種不同規格的商品 (如不同倍數的個股期)，而不需要硬編碼。
 ---
 
-## 3. 類別關係圖 (Class Diagram)
+## 3. GUI 架構與互動設計 (GUI Architecture) - **New!**
+本系統包含一個基於 `tkinter` 的圖形化介面 (`gui_dashboard.py`)，提供即時監控與控制功能。
+
+### A. 介面佈局 (Layout)
+採用 `Dark Theme` 風格，視窗分割為三個主要區域：
+
+1.  **控制列 (Top Control Bar)**
+    *   **Status Label**: 顯示系統狀態 (INIT / RUNNING / STOPPED)。
+    *   **Fund Label**: **[New!]** 即時顯示現金水位 (`Cash`) 與預估佔用保證金 (`Est.Cost`)。
+    *   **Buttons**:
+        *   `SYNC POS`: 強制與券商伺服器同步部位 (開新執行緒執行，不卡頓 UI)。
+        *   `FORCE REPAIR`: 手動觸發 `trigger_repair`，強制補足缺腳。
+        *   `STOP SYSTEM`: 安全停止所有執行緒並關閉視窗。
+
+2.  **監控面板 (Monitored Pairs - Top Pane)**
+    *   **元件**: `Treeview` 表格。
+    *   **內容**: 顯示所有訂閱的「股票-期貨」對。
+    *   **關鍵欄位**:
+        *   `Spread` (價差): `Bid_Fut - Ask_Stk`。
+        *   `Z-Score`: 動態統計指標，判斷是否過熱。
+        *   `Signal`: 顯示當前策略訊號 (Active / Wait)。
+
+3.  **狀態面板 (Status Pane - Bottom Split)**
+    *   **左側 (Holdings)**: 當前持倉部位 (`PortfolioLedger`)。
+    *   **右側 (Orders)**: 最近 25 筆交易與委託單狀態 (`Active/Completed Transactions`)。
+
+### B. 更新機制 (Update Loop)
+為了保持介面流暢度 (Responsiveness)，GUI 採用 **Polling (輪詢)** 機制，與核心邏輯分離。
+
+*   **Main Thread (GUI)**:
+    *   `update_loop()`: 每 **50ms** 觸發一次。
+    *   `_refresh_ui()`: 每 **500ms** (0.5s) 執行一次重繪。
+    *   **Read-Only**: 從 `TransactionManager` 讀取 `market_data`, `active_transactions`, `ledger` 等共用物件。因為 Python 的 GIL 與 `Dict` 原子性，讀取通常無需重鎖 (或僅需極短的鎖)，確保 GUI 不會因為策略運算卡住。
+
+*   **Background Thread (Logic)**:
+    *   負責 API 交互、策略運算、下單。
+    *   GUI 按鈕 (如 Sync) 若涉及 API 呼叫，會啟動 **第三個臨時執行緒** 來執行，避免按鈕按下後視窗凍結。
+
+---
+
+## 4. 類別關係圖 (Class Diagram)
 
 ```mermaid
 classDiagram
@@ -184,7 +224,7 @@ classDiagram
 
 ---
 
-## 4. 關鍵調用流程 (Key Call Flows)
+## 5. 關鍵調用流程 (Key Call Flows)
 
 ### A. 系統啟動與註冊流程 (System Startup & Registration) - **Deep Dive**
 這一節描述了系統從 `main()` 入口到完全運作的每一步，特別是 **Worker Queue** 與 **Background Logic** 的初始化。
@@ -563,7 +603,7 @@ sequenceDiagram
 
 ---
 
-## 5. 總結
+## 6. 總結
 1.  **分層明確**：GUI / Logic / Data / Driver 各司其職。
 2.  **執行緒安全**：GUI 讀取與 Logic 寫入透過 `_lock` 或 Copy 保護。
 3.  **完整生命週期**: 從 Startup -> Discovery -> Capital Check -> Order Execution -> Callback Update -> Termination/Failover.
