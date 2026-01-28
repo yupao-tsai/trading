@@ -13,7 +13,6 @@ from enum import Enum, auto
 from typing import Dict, List, Optional, Any, Tuple, Callable
 from dataclasses import dataclass, field
 import dataclasses
-import dataclasses
 import traceback
 from dotenv import load_dotenv
 import queue  # <--- Added for Event Queue
@@ -269,9 +268,6 @@ class SystemConfig:
     MAIN_LOOP_SLEEP = 0.1
     LEG1_TIMEOUT = 90.0
     LEG2_TIMEOUT = 20.0
-    LEG2_TIMEOUT = 20.0
-    DEFAULT_LOT_SIZE = 1000
-    LEG2_TIMEOUT = 20.0
     DEFAULT_LOT_SIZE = 1000
     CONNECTION_CHECK_INTERVAL = 60.0
     STOCK_SHARES_PER_LOT = 1000
@@ -435,22 +431,22 @@ class MarketSnapshot:
         except Exception:
             pass
         # some tick has bid/ask too
-        for k in ("bid_price", "bid", "bidPrice"):
-            try:
-                v = getattr(tick, k, None)
-                if v is not None:
-                    self.bid = float(v)
-                    break
-            except Exception:
-                pass
-        for k in ("ask_price", "ask", "askPrice"):
-            try:
-                v = getattr(tick, k, None)
-                if v is not None:
-                    self.ask = float(v)
-                    break
-            except Exception:
-                pass
+        # for k in ("bid_price", "bid", "bidPrice"):
+        #     try:
+        #         v = getattr(tick, k, None)
+        #         if v is not None:
+        #             self.bid = float(v)
+        #             break
+        #     except Exception:
+        #         pass
+        # for k in ("ask_price", "ask", "askPrice"):
+        #     try:
+        #         v = getattr(tick, k, None)
+        #         if v is not None:
+        #             self.ask = float(v)
+        #             break
+        #     except Exception:
+        #         pass
 
     def update_from_bidask(self, bidask: Any):
         self.ts = time.time()
@@ -684,6 +680,7 @@ class StrategyEngine:
         self.md = market_data
         self.check_holdings_cb = check_holdings_cb or (lambda s, f: False)
         self.get_book_gate_cb = get_book_gate_cb or (lambda: (10, 10))
+        self._lock = threading.Lock()
 
         self.stats: Dict[Tuple[str, str, str], RunningStat] = {}
 
@@ -696,7 +693,6 @@ class StrategyEngine:
         self.DEFAULT_QTY = 1
         # =========================================
 
-        self._cooldown: Dict[Tuple[str, str], float] = {}
         self._cooldown: Dict[Tuple[str, str], float] = {}
         self.COOLDOWN_SEC = SystemConfig.REPAIR_COOLDOWN
         self.MAX_STALENESS = SystemConfig.STALENESS_THRESHOLD
@@ -719,77 +715,78 @@ class StrategyEngine:
         if fut.bid <= 0 and fut.ask <= 0 and fut.price <= 0:
             return None
 
-        # compute spreads
-        s_ask = stk.ask if stk.ask > 0 else stk.price
-        s_bid = stk.bid if stk.bid > 0 else stk.price
-        f_bid = fut.bid if fut.bid > 0 else fut.price
-        f_ask = fut.ask if fut.ask > 0 else fut.price
-        if s_ask <= 0 or s_bid <= 0 or f_bid <= 0 or f_ask <= 0:
+        with self._lock:
+            # compute spreads
+            s_ask = stk.ask if stk.ask > 0 else stk.price
+            s_bid = stk.bid if stk.bid > 0 else stk.price
+            f_bid = fut.bid if fut.bid > 0 else fut.price
+            f_ask = fut.ask if fut.ask > 0 else fut.price
+            if s_ask <= 0 or s_bid <= 0 or f_bid <= 0 or f_ask <= 0:
+                return None
+
+            spread_open = f_bid - s_ask
+            spread_close = f_ask - s_bid
+
+            st_open = self._get_stat(stock_code, future_code, "OPEN")
+            st_close = self._get_stat(stock_code, future_code, "CLOSE")
+
+            # update stats
+            st_open.update(spread_open)
+            st_close.update(spread_close)
+
+            # cooldown
+            now = time.time()
+
+            # Data Staleness Gate
+            if (now - stk.ts > self.MAX_STALENESS) or (now - fut.ts > self.MAX_STALENESS):
+                return None
+
+            cd_key = (stock_code, future_code)
+            exp = self._cooldown.get(cd_key, 0.0)
+            if now < exp:
+                return None
+
+            # avoid entering if already holding/active
+            is_holding = self.check_holdings_cb(stock_code, future_code)
+
+            # book gate thresholds
+            min_stk_book, min_fut_book = self.get_book_gate_cb()
+
+            # OPEN signal:
+            if not is_holding and st_open.samples >= self.MIN_SAMPLES:
+                std = max(st_open.std, self.MIN_STD)
+                z = (spread_open - st_open.mean) / std
+                edge_pct = (f_bid - s_ask) / max(1e-9, s_ask)
+                if z >= self.OPEN_Z and edge_pct >= self.MIN_EDGE_PCT:
+                    # extra liquidity gate here (soft; Tx class will hard gate again)
+                    if stk.ask_size < min_stk_book or fut.bid_size < min_fut_book:
+                        return None
+                    self._cooldown[cd_key] = now + self.COOLDOWN_SEC
+                    return TradeIntent(
+                        type=SignalType.OPEN,
+                        stock_code=stock_code,
+                        future_code=future_code,
+                        qty=self.DEFAULT_QTY,
+                        details=f"OPEN z={z:.2f} edge={edge_pct*100:.2f}% sprd={spread_open:.2f} mean={st_open.mean:.2f} std={std:.2f}"
+                    )
+
+            # CLOSE signal: if we are holding (or manager will check shape)
+            # Strategy only emits close when spread_close is "low" vs mean (mean-revert).
+            if is_holding and st_close.samples >= self.MIN_SAMPLES:
+                std = max(st_close.std, self.MIN_STD)
+                z = (spread_close - st_close.mean) / std
+                if z <= self.CLOSE_Z:
+                    # we let TxMgr _check_position_safety() decide if shape is correct
+                    self._cooldown[cd_key] = now + self.COOLDOWN_SEC
+                    return TradeIntent(
+                        type=SignalType.CLOSE,
+                        stock_code=stock_code,
+                        future_code=future_code,
+                        qty=self.DEFAULT_QTY,
+                        details=f"CLOSE z={z:.2f} sprd={spread_close:.2f} mean={st_close.mean:.2f} std={std:.2f}"
+                    )
+
             return None
-
-        spread_open = f_bid - s_ask
-        spread_close = f_ask - s_bid
-
-        st_open = self._get_stat(stock_code, future_code, "OPEN")
-        st_close = self._get_stat(stock_code, future_code, "CLOSE")
-
-        # update stats
-        st_open.update(spread_open)
-        st_close.update(spread_close)
-
-        # cooldown
-        now = time.time()
-
-        # Data Staleness Gate
-        if (now - stk.ts > self.MAX_STALENESS) or (now - fut.ts > self.MAX_STALENESS):
-            return None
-
-        cd_key = (stock_code, future_code)
-        exp = self._cooldown.get(cd_key, 0.0)
-        if now < exp:
-            return None
-
-        # avoid entering if already holding/active
-        is_holding = self.check_holdings_cb(stock_code, future_code)
-
-        # book gate thresholds
-        min_stk_book, min_fut_book = self.get_book_gate_cb()
-
-        # OPEN signal:
-        if not is_holding and st_open.samples >= self.MIN_SAMPLES:
-            std = max(st_open.std, self.MIN_STD)
-            z = (spread_open - st_open.mean) / std
-            edge_pct = (f_bid - s_ask) / max(1e-9, s_ask)
-            if z >= self.OPEN_Z and edge_pct >= self.MIN_EDGE_PCT:
-                # extra liquidity gate here (soft; Tx class will hard gate again)
-                if stk.ask_size < min_stk_book or fut.bid_size < min_fut_book:
-                    return None
-                self._cooldown[cd_key] = now + self.COOLDOWN_SEC
-                return TradeIntent(
-                    type=SignalType.OPEN,
-                    stock_code=stock_code,
-                    future_code=future_code,
-                    qty=self.DEFAULT_QTY,
-                    details=f"OPEN z={z:.2f} edge={edge_pct*100:.2f}% sprd={spread_open:.2f} mean={st_open.mean:.2f} std={std:.2f}"
-                )
-
-        # CLOSE signal: if we are holding (or manager will check shape)
-        # Strategy only emits close when spread_close is "low" vs mean (mean-revert).
-        if is_holding and st_close.samples >= self.MIN_SAMPLES:
-            std = max(st_close.std, self.MIN_STD)
-            z = (spread_close - st_close.mean) / std
-            if z <= self.CLOSE_Z:
-                # we let TxMgr _check_position_safety() decide if shape is correct
-                self._cooldown[cd_key] = now + self.COOLDOWN_SEC
-                return TradeIntent(
-                    type=SignalType.CLOSE,
-                    stock_code=stock_code,
-                    future_code=future_code,
-                    qty=self.DEFAULT_QTY,
-                    details=f"CLOSE z={z:.2f} sprd={spread_close:.2f} mean={st_close.mean:.2f} std={std:.2f}"
-                )
-
-        return None
 
 
 # ============================================================
@@ -833,6 +830,22 @@ class PortfolioLedger:
 
     def upsert(self, line: PositionLine):
         self.positions[line.code] = line
+
+    def check_funds(self, req_cash: float, req_margin: float) -> bool:
+        """
+        Returns True if total occupied (held + reserved) + required <= cash_total.
+        """
+        s_cost, f_margin = self.est_holding_cost()
+        occupied = s_cost + f_margin + self.reserved_stock + self.reserved_margin
+        return (occupied + req_cash + req_margin) <= self.cash_total
+
+    def reserve_funds(self, req_cash: float, req_margin: float):
+        self.reserved_stock += req_cash
+        self.reserved_margin += req_margin
+
+    def release_reserved(self, req_cash: float, req_margin: float):
+        self.reserved_stock = max(0.0, self.reserved_stock - req_cash)
+        self.reserved_margin = max(0.0, self.reserved_margin - req_margin)
 
     def est_holding_cost(self) -> Tuple[float, float]:
         """
@@ -1479,18 +1492,6 @@ class ExecutionEngine:
                 lines.append(f"  {k}: {v}")
         return "\n".join(lines)
 
-
-# ============================================================
-# ==================  你的 Part2 / Part3  ====================
-# ============================================================
-# 你已經貼了：
-#   - BaseTransaction / SimultaneousOpenTransaction / SimultaneousCloseTransaction
-#   - PairDiscovery
-#   - TransactionManager
-# 下面這一段請直接把你貼的 part2 + part3 原封不動貼回來。
-#
-# 為了讓這份檔案「單檔可跑」，我在這裡直接把你貼的 part2/part3 原樣放入。
-# ============================================================
 
 # --- Core Transaction Classes ---
 
@@ -2712,7 +2713,6 @@ class TransactionManager:
         self.last_conn_check_ts: float = time.time()
 
         self.reporter: Optional[AccountReporter] = None
-        self.reporter: Optional[AccountReporter] = None
         self.ledger = PortfolioLedger(fut_multiplier_default=2000, fut_margin_ratio=0.5) # shares/2000 default
         self.ledger.cash_total = initial_cash # Set initial cash
         self.initial_cash = initial_cash # Store initial cash for fallback
@@ -2721,6 +2721,13 @@ class TransactionManager:
         self.event_queue = queue.Queue()
         self._worker_thread = threading.Thread(target=self._event_worker_loop, daemon=True, name="TxEventWorker")
         self._worker_thread.start()
+
+        # --- Quote Worker Implementation (Coalescing) ---
+        self._pending_quote_codes: set[str] = set()
+        self._quote_event = threading.Event()
+        self._quote_lock = threading.Lock()
+        self._quote_worker_thread = threading.Thread(target=self._quote_worker_loop, daemon=True, name="QuoteWorker")
+        self._quote_worker_thread.start()
 
 
     def print_portfolio(self, tag: str):
@@ -2864,18 +2871,48 @@ class TransactionManager:
                 self.execution.api.quote.subscribe(c_fut, quote_type=sj_constant.QuoteType.BidAsk)
 
     def _on_market_tick(self, code: str):
-        affected_pairs = self._pair_map.get(code)
-        if not affected_pairs:
-            return
+        # Optimization: Don't block API thread. Signal worker.
+        with self._quote_lock:
+             self._pending_quote_codes.add(code)
+        self._quote_event.set()
 
-        for s, f in affected_pairs:
-            with self._lock:
-                if s in self.active_transactions:
-                    continue
+    def _quote_worker_loop(self):
+        print("[TxMgr] Quote Logic Worker Started.")
+        while True:
+             self._quote_event.wait()
+             self._quote_event.clear()
 
-            intent = self.strategy.on_tick(s, f)
-            if intent:
-                self.request_new_transaction(intent)
+             pending = []
+             with self._quote_lock:
+                 if not self._pending_quote_codes:
+                     continue
+                 pending = list(self._pending_quote_codes)
+                 # Clear set implicitly by creating new empty set
+                 # (so incoming ticks during processing fill the new one)
+                 self._pending_quote_codes = set()
+            
+             if not pending:
+                 continue
+
+             # Coalesce: find unique pairs affected
+             unique_pairs = set()
+             for code in pending:
+                 pairs = self._pair_map.get(code)
+                 if pairs:
+                     for p in pairs:
+                         unique_pairs.add(p)
+            
+             # Process Unique Pairs
+             for s, f in unique_pairs:
+                 # Check active transactions with main lock
+                 with self._lock:
+                     if s in self.active_transactions:
+                         continue
+                 
+                 # Strategy logic (thread-safe inside StrategyEngine)
+                 intent = self.strategy.on_tick(s, f)
+                 if intent:
+                     self.request_new_transaction(intent)
 
     def _check_position_safety(self, intent: TradeIntent) -> bool:
         positions = self.execution.get_all_positions()
@@ -2946,8 +2983,12 @@ class TransactionManager:
                     est_fut = fut_snap.bid if fut_snap.bid > 0 else fut_snap.price
                     req_margin = est_fut * intent.qty * fut_mult * self.ledger.fut_margin_ratio
 
-                    self.ledger.reserved_stock += req_cash
-                    self.ledger.reserved_margin += req_margin
+                    # --- FUND CHECK ---
+                    if not self.ledger.check_funds(req_cash, req_margin):
+                        print(f"[TxMgr] REJECT OPEN: Insufficient Funds. Required Cash={req_cash:,.0f}, Margin={req_margin:,.0f}")
+                        return False
+
+                    self.ledger.reserve_funds(req_cash, req_margin)
                     tx.reserved_cash = req_cash
                     tx.reserved_margin = req_margin
 
@@ -2964,11 +3005,7 @@ class TransactionManager:
         """Releases reserved funds when tx is done/failed."""
         reserved_c = getattr(tx, "reserved_cash", 0.0)
         reserved_m = getattr(tx, "reserved_margin", 0.0)
-        if reserved_c > 0:
-            self.ledger.reserved_stock = max(0.0, self.ledger.reserved_stock - reserved_c)
-        if reserved_m > 0:
-            self.ledger.reserved_margin = max(0.0, self.ledger.reserved_margin - reserved_m)
-
+        self.ledger.release_reserved(reserved_c, reserved_m)
         tx.reserved_cash = 0.0
         tx.reserved_margin = 0.0
 

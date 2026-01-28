@@ -24,6 +24,16 @@
     *   `ZOMBIE_TIMEOUT`: 交易卡死多久後強制清除。
     *   `REPAIR_COOLDOWN`: 觸發修復後要冷靜多久。
 
+### H. InstrumentRegistry (商品註冊表) - **[New!]**
+*   **用途**: 集中管理所有商品的合約規格與單位換算，確保全系統單位統一。
+*   **關鍵變數**:
+    *   `_specs`: 字典結構 `{code: {'type': 'Stock'|'Future', 'multiplier': int}}`。
+        *   **Stock**: `multiplier` 通常為 1000 (股)。
+        *   **Future**: `multiplier` 為合約乘數 (例如台指期 200, 個股期 2000)。
+*   **功能**:
+    *   `get_ratio(stock, future)`: 動態計算避險比例。例如 `Fut(2000) / Stk(1000) = 2.0`。
+    *   確保系統能支援各種不同規格的商品 (如不同倍數的個股期)，而不需要硬編碼。
+
 ### B. MarketData (行情資料庫)
 *   **用途**: Thread-safe 的行情快照儲存。
 *   **特點**:
@@ -209,7 +219,7 @@ sequenceDiagram
     Note over Main: 4. GUI Launch
     Main->>Main: ArbitrageDashboard(TM)
     Main->>Main: discover_and_subscribe() (See Flow B)
-    Main->>Main: Start Logic Thread
+    Main->>Main: Start Logic Thread (See Flow H)
     Main->>Main: GUI.run()
 ```
 
@@ -284,9 +294,10 @@ sequenceDiagram
     participant Tx as Transaction
 
     Ex->>API: Tick Data (Quote)
-    API->>TM: _on_market_tick(code)
-    TM->>MD: update_stock/future(tick)
+    API->>TM: _on_tick_stk/quote_stk/_on_tick_fop/quote_fop(code)
+    TM->>MD: update_stock/future(tick/quote)
     Note right of MD: Check Threshold (Size Gate)
+    MD->>TM: _on_market_tick(code)
     
     rect rgb(240, 248, 255)
         Note right of TM: Fast Lookup
@@ -300,7 +311,7 @@ sequenceDiagram
         
         alt Signal Triggered (Valid)
             Strat-->>TM: TradeIntent (e.g. OPEN)
-            
+            Note over TM: request_new_transaction
             rect rgb(230, 230, 255)
                 Note right of TM: Capital Gate
                 TM->>Ledger: check_funds(Cost)
@@ -373,7 +384,7 @@ sequenceDiagram
 
 ### F. 缺腳與救援流程 (Legging Risk / Failover Logic)
 當一腳成交一腳未成交 (超時) 時的救援邏輯。這是 `BaseTransaction._timeout_and_hedge` 的具體實作。
-**假設比例：1 口期貨 = 2 張股票 (Ratio 1:2)。**
+**避險比例 (RATIO) 由 `InstrumentRegistry` 動態提供 (例如 1 Future = 2 Stocks)。**
 
 ```mermaid
 sequenceDiagram
@@ -394,14 +405,15 @@ sequenceDiagram
                  Note right of Tx: FORCE COMPLETION
                  Tx->>API: Cancel Both Orders
                  
-                 Tx->>Tx: Calc Excess Stock = S - (F * 2)
+                 Tx->>Tx: Get RATIO = Registry.get_ratio(S, F)
+                 Tx->>Tx: Calc Excess Stock = S - (F * RATIO)
                  
-                 alt Excess >= 2 (Even Lots)
+                 alt Excess >= RATIO (Full Future Lots)
                     rect rgb(200, 255, 200)
                         Note right of Tx: HEDGE (Sell Future)
-                        Tx->>API: Sell Future (Excess // 2)
+                        Tx->>API: Sell Future (Excess // RATIO)
                     end
-                 else Excess == 1 (Odd Lot)
+                 else 0 < Excess < RATIO (Odd Lot)
                     rect rgb(255, 200, 200)
                         Note right of Tx: RETREAT (Sell Stock)
                         Tx->>API: Sell Excess Stock (Close Position)
