@@ -220,7 +220,15 @@ sequenceDiagram
     Exec->>API: login(...) & activate_ca(...)
     Exec->>API: set_order_callback(self._order_cb)
     
-    Note over Main: 3. Pair Discovery (Blocking)
+    Note over Main: 3. Quote Registration
+    Main->>TM: start()
+    TM->>API: set_on_tick_stk_v1_callback(_on_tick_stk)
+    TM->>API: set_on_tick_fop_v1_callback(_on_tick_fop)
+    TM->>API: set_on_bidask_stk_v1_callback(_on_quote_stk)
+    TM->>API: set_on_bidask_fop_v1_callback(_on_quote_fop)
+    TM->>TM: sync_held_positions()
+    
+    Note over Main: 4. Pair Discovery (Blocking)
     Main->>TM: discover_and_subscribe()
     TM->>API: List Positions (Sync Held)
     TM->>API: Scan Contracts & Volumes
