@@ -89,11 +89,14 @@
 classDiagram
     class TransactionManager {
         +event_queue: Queue
+        +_pending_quote_codes: Set
+        +_quote_event: Event
         +active_transactions: Dict
         +run_step()
+        +_on_market_tick()
+        +_quote_worker_loop()
         +on_execution_event()
         +start()
-        +discover_and_subscribe()
     }
 
     class ExecutionEngine {
@@ -114,15 +117,20 @@ classDiagram
     }
 
     class StrategyEngine {
+        +_lock: Lock
         +on_tick(stock, future) -> TradeIntent
         +calc_spread()
     }
 
     class PortfolioLedger {
         +positions: Dict
-        +check_funds()
-        +reserve_funds()
-        +release_reserved()
+        +cash_total: Float
+        +reserved_stock: Float
+        +reserved_margin: Float
+        +check_funds(cash, margin) -> bool
+        +reserve_funds(cash, margin)
+        +release_reserved(cash, margin)
+        +est_holding_cost()
         +upsert()
     }
 
