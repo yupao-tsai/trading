@@ -222,13 +222,28 @@ def main():
     api.fetch_contracts(contract_download=True)
     print("[Fetch contracts] OK")
 
-    sent_codes = set()
+    print("[Cancel Open Orders] ...")
+
+
     max_loops = 10
 
     for loop in range(1, max_loops + 1):
         print(f"\n[Loop {loop}] Scan positions ...")
 
         stock_pos = list_stock_positions(api, timeout_ms=10000, retries=3)
+        
+        # --- Cancellation (Moved Inside Loop) ---
+        print("  [Check Open Orders] ...")
+        try:
+            api.update_status()
+            for trade in api.list_trades():
+                if trade.status.status in ("PreSubmitted", "Submitted", "PartFilled"):
+                    api.cancel_order(trade)
+                    print(f"    Cancelled: {trade.contract.code} {trade.order.action}")
+            time.sleep(2.0) # Wait for cancellation effect
+        except Exception as e: 
+            print(f"    Cancel check failed: {e}")
+        # ----------------------------------------
         stock_pos = [p for p in stock_pos if int(getattr(p, "quantity", 0)) != 0]
 
         fut_pos = list_fut_positions_best_effort(api, timeout_ms=8000, retries=2)
@@ -247,8 +262,8 @@ def main():
             qty  = int(p.quantity)
             direction = str(p.direction)
 
-            if code in sent_codes:
-                continue
+            # if code in sent_codes:
+            #     continue
 
             # Direction: Buy -> Sell, Sell -> Buy
             action = sj.constant.Action.Sell if "Buy" in direction else sj.constant.Action.Buy
@@ -264,18 +279,22 @@ def main():
                 print(f"[Send] {code}: {action.value} {qty_use} ({lot_type}) @ {px_type}({px_val}) [{tag}]")
                 if DRY_RUN: return True, "00", "OK"
                 
-                ord_s = api.Order(
-                    action=action,
-                    price=px_val,
-                    quantity=qty_use,
-                    price_type=px_type,
-                    order_type=sj.constant.OrderType.IOC if px_type == sj.constant.StockPriceType.MKT else sj.constant.OrderType.ROD,
-                    order_cond=sj.constant.StockOrderCond.Cash,
-                    order_lot=lot_type,
-                    daytrade_short=False,
-                    account=api.stock_account,
-                )
-                t = api.place_order(contract, ord_s)
+                try:
+                    ord_s = api.Order(
+                        action=action,
+                        price=px_val,
+                        quantity=qty_use,
+                        price_type=px_type,
+                        order_type=sj.constant.OrderType.IOC, # Always IOC for clearing
+                        order_cond=sj.constant.StockOrderCond.Cash,
+                        order_lot=lot_type,
+                        daytrade_short=False,
+                        account=api.stock_account,
+                    )
+                    t = api.place_order(contract, ord_s, timeout=10000) # Added timeout
+                except Exception as e:
+                    print(f"  -> ERROR ({tag}): {e}")
+                    return False, "Ex", str(e)
                 
                 # Check immediate rejection
                 op = getattr(t, "operation", {}) or {}
@@ -307,7 +326,7 @@ def main():
             )
             
             if ok:
-                sent_codes.add(code)
+                pass # sent_codes.add(code)
                 continue
 
             # 2. Tier 2: Limit Price (Limit Up/Down) with IOC
@@ -335,7 +354,7 @@ def main():
             )
 
             if ok:
-                sent_codes.add(code)
+                pass # sent_codes.add(code)
             else:
                 print(f"[Error] All attempts failed for stock {code}")
             
@@ -358,8 +377,8 @@ def main():
             qty  = int(p.quantity)
             direction = str(p.direction)
 
-            if code in sent_codes:
-                continue
+            # if code in sent_codes:
+            #     continue
             
             # Direction: Buy -> Sell, Sell -> Buy
             action = sj.constant.Action.Sell if "Buy" in direction else sj.constant.Action.Buy
@@ -390,16 +409,21 @@ def main():
                 # Fix: Check if FuturesOrderType exists, else use OrderType
                 fut_order_type_cls = getattr(sj.constant, "FuturesOrderType", sj.constant.OrderType)
 
-                ord_f = api.Order(
-                    action=action,
-                    price=px_val,
-                    quantity=q,
-                    price_type=px_type,
-                    order_type=fut_order_type_cls.IOC if px_type == sj.constant.FuturesPriceType.MKT else fut_order_type_cls.ROD,
-                    octype=sj.constant.FuturesOCType.Auto,
-                    account=api.futopt_account
-                )
-                t = api.place_order(contract, ord_f)
+                try:
+                    ord_f = api.Order(
+                        action=action,
+                        price=px_val,
+                        quantity=q,
+                        price_type=px_type,
+                        order_type=fut_order_type_cls.IOC, # Always IOC for clearing
+                        octype=sj.constant.FuturesOCType.Auto,
+                        account=api.futopt_account
+                    )
+                    t = api.place_order(contract, ord_f, timeout=10000) # Added timeout
+                except Exception as e:
+                     print(f"  -> ERROR ({tag}): {e}")
+                     return False
+
                 op = getattr(t, "operation", {}) or {}
                 if isinstance(op, dict):
                     c = str(op.get("op_code", ""))
@@ -420,7 +444,7 @@ def main():
             )
             
             if ok:
-                sent_codes.add(code)
+                pass # sent_codes.add(code)
                 continue
             
             # 2. Tier 2: Aggressive Limit IOC (Limit Up/Down)
@@ -442,7 +466,7 @@ def main():
                     px_val=lmt_px,
                     tag="FUT_LMT_IOC"
                  )
-                 if ok: sent_codes.add(code)
+                 if ok: pass # sent_codes.add(code)
 
         print("\n[Wait] 8s then rescan ...")
         time.sleep(8)

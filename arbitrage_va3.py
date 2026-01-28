@@ -225,6 +225,8 @@ class CLevelFilter:
 # --- 全域設定 ---
 # =========================
 SIMULATION = True
+DBG_WATCH_STOCK = "2330" # Default watch for debug
+
 ORDER_HISTORY_FILE = "order_history.jsonl"  # 本地訂單記錄檔
 
 # Risk & Stability (P0)
@@ -238,7 +240,7 @@ AUTO_CLOSE_BROKEN_LEGS = False # 啟動時是否自動平倉壞部位 (Danger!)
 STOCK_QTY = 2          # 現股張數（Common lot）
 FUTURE_QTY = 1         # 期貨口數
 MIN_ORDER_QTY_THRESHOLD = 3 # 最佳一檔掛單量門檻 (張/口)
-MAX_CAPITAL = 10000000 # 最大總投資金額 (1000萬)
+MAX_CAPITAL = 1000000 # 最大總投資金額 (1000萬)
 ENTRY_THRESHOLD = 100  # 進場淨利門檻（以金額）
 EXIT_THRESHOLD = 0     # 出場價差門檻
 MIN_TOP_VOLUME = 3     # 最佳一檔量門檻 (Stock Ask >= 3, Future Bid >= 3)
@@ -841,6 +843,22 @@ class PositionManager:
                 ps.inflight = False
                 ps.last_action_ts = time.time()
 
+
+
+    # ---------- Order Pending Lock (Persistent across ticks) ----------
+    def set_order_pending(self, stock_code: str, pending: bool) -> None:
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if ps:
+                ps.order_pending = bool(pending)
+                # print(f"[PosMgr] {stock_code} OrderPending={ps.order_pending}")
+
+    def is_order_pending(self, stock_code: str) -> bool:
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps: return False
+            return getattr(ps, "order_pending", False)
+    
     # ---------- Phase helpers ----------
     def prepare_phase(self, stock_code: str, phase: str, target_stock_lots: int, target_fut_qty: int, last_signal_net: float = 0.0):
         with self._lock:
@@ -946,6 +964,30 @@ class PositionManager:
             
         return list(set(pending_ids))
 
+    def force_clear_pending_legs(self, stock_code: str) -> None:
+        """
+        Force resets any leg that is currently in a pending state.
+        This is used when CANCEL_ALL fails (e.g. order not found), so we must manually
+        forget the order to allow the bot to proceed with Repair.
+        """
+        with self._lock:
+            ps = self._pairs.get(stock_code)
+            if not ps:
+                return
+
+            def clear_if_pending(leg_fill):
+                # If leg is occupied and status is active (not Filled/Cancelled/Failed)
+                if leg_fill and leg_fill.order_id and leg_fill.status in ["INIT", "Submitted", "PartFilled", "Ranking", "PendingSubmit"]:
+                    # We reset it to a fresh LegFill, effectively "forgetting" the stuck order.
+                    # Position/Shares will be corrected by the next sync_from_snapshot.
+                    return LegFill()
+                return leg_fill
+
+            ps.open_stock = clear_if_pending(ps.open_stock)
+            ps.open_future = clear_if_pending(ps.open_future)
+            ps.close_stock = clear_if_pending(ps.close_stock)
+            ps.close_future = clear_if_pending(ps.close_future)
+
     def _append_order_event(self, ev: Dict[str, Any]) -> None:
         self._orders_ring.append(ev)
         if len(self._orders_ring) > self._orders_ring_max:
@@ -1013,6 +1055,13 @@ class PositionManager:
 
                 # zero -> EMPTY
                 if ps.pos_stock_shares == 0 and ps.pos_fut_qty == 0:
+                    # [FIX] Logic to prevent prematurely resetting to EMPTY during PENDING_ENTRY
+                    # If we are PENDING_ENTRY, we expect positions to arrive. 
+                    # Snapshot might be lagging (showing 0) while we just filled.
+                    # Trust the Strategy/Timeout logic to handle failures.
+                    if ps.state == PositionState.PENDING_ENTRY:
+                        continue
+                        
                     ps.state = PositionState.EMPTY
                     ps.unhedged_ts = 0.0
                     continue
@@ -1033,13 +1082,40 @@ class PositionManager:
                     # ✅ FIX: 如果還在 pending 狀態（Execution Engine 還在跑），不要被 Snapshot 強制拉回 Repairing
                     # 只有當原本已經是 HOLDING/REPAIRING/EMPTY 卻發現不平衡時，才觸發 Repair
                     if ps.state in (PositionState.PENDING_ENTRY, PositionState.PENDING_EXIT):
+                        # [FIX] Grace Period for PENDING_ENTRY (10s)
+                        # If we are PENDING_ENTRY, check for grace period
+                        if ps.state == PositionState.PENDING_ENTRY:
+                            if (now - getattr(ps, "last_entry_ts", 0)) < 10.0:
+                                # Allow temporary mismatch
+                                pass
+                        
                         # do nothing, let execution engine handle it (or timeout)
                         pass
                     else:
-                        if ps.state != PositionState.REPAIRING:
-                            ps.unhedged_ts = time.time()
-                            changed.append(ps.stock_code)
-                        ps.state = PositionState.REPAIRING
+                        # ✅ Check for Odd Lot (Unhedgeable small exposure)
+                        # If net delta is less than 1 contract (feq), treat as acceptable deviation (HOLDING)
+                        # but still log a warning once.
+                        
+                        net_delta_shares = abs(ps.pos_stock_shares + (ps.pos_fut_qty * feq))
+                        if net_delta_shares > 0 and net_delta_shares < feq:
+                             # Odd lot / Dividend remainder case
+                             # Don't block system. Treat as HOLDING.
+                             if ps.state != PositionState.HOLDING:
+                                 print(f"[PosMgr] ⚠️ Odd Lot Detected for {ps.stock_code}: Net={net_delta_shares} shares < 1 contract ({feq}). Marking as HOLDING (Non-Blocking).")
+                                 ps.state = PositionState.HOLDING
+                             # Odd lot / Dividend remainder case
+                             # Don't block system. Treat as HOLDING.
+                             if ps.state != PositionState.HOLDING:
+                                 print(f"[PosMgr] ⚠️ Odd Lot Detected for {ps.stock_code}: Net={net_delta_shares} shares < 1 contract ({feq}). Marking as HOLDING (Non-Blocking).")
+                                 ps.state = PositionState.HOLDING
+                             ps.unhedged_ts = 0.0 # Clear unhedged timer so it doesn't look broken
+                        else:
+                            # Genuine breakage >= 1 contract
+                            if ps.state != PositionState.REPAIRING:
+                                print(f"[PosMgr] 🚨 {ps.stock_code} entering REPAIRING! S={ps.pos_stock_shares} F={ps.pos_fut_qty} feq={feq} Net={net_delta_shares}")
+                                ps.unhedged_ts = time.time()
+                                changed.append(ps.stock_code)
+                            ps.state = PositionState.REPAIRING
 
         return changed
 
@@ -1318,9 +1394,6 @@ class Reconciler:
         except Exception as e:
             print(f"  [Reconciler] matching scan failed: {e}")
 
-        # 2. Fallback: 1-to-1 Force Link (SIMULATION ONLY)
-        # If we have exactly 1 unknown stock and 1 held future (unmatched), link them.
-        # This fixes simulation data errors (e.g. QEFA6 -> 2327 instead of 8358)
         if SIMULATION and not matches and len(unknown_stocks) == 1 and len(held_futures) == 1:
              s = unknown_stocks[0]
              f = held_futures[0]
@@ -1329,7 +1402,31 @@ class Reconciler:
 
         for s, f in matches.items():
             print(f"  [Reconciler] Auto-linked {s} -> {f}")
-            self.pos_mgr.ensure_pair(s, f)
+            
+            # Determine share equiv
+            shares_equiv = 2000
+            try:
+                # Find contract to check name
+                found_c = None
+                for category in self.api.Contracts.Futures:
+                    try: iter(category)
+                    except: continue
+                    for c in category:
+                        if isinstance(c, tuple): c = c[1]
+                        if getattr(c, 'code', '') == f:
+                            found_c = c
+                            break
+                    if found_c: break
+                
+                if found_c:
+                    c_name = str(getattr(found_c, 'name', '') or "")
+                    if "小型" in c_name or "微型" in c_name:
+                        shares_equiv = 100
+                    print(f"  [Reconciler] {f} ({c_name}) -> equiv={shares_equiv}")
+            except Exception as e:
+                print(f"  [Reconciler] share check failed: {e}")
+                
+            self.pos_mgr.ensure_pair(s, f, future_shares_equiv=shares_equiv)
 
 
     def _fetch_snapshot_once(self) -> AccountSnapshot:
@@ -1672,20 +1769,24 @@ class PairDiscoverer:
                     if not (is_current or is_next):
                         continue
 
-                    # filter out small/mini by name (best-effort)
-                    c_name = str(getattr(contract, 'name', '') or "")
-                    if ("小型" in c_name) or ("微型" in c_name):
-                        continue
-
                     # shares unit
                     f_unit = int(getattr(contract, 'unit', 0) or 0)
-                    shares_equiv = 0
-                    if f_unit == FUTURE_SHARES_EQUIV:
-                        shares_equiv = FUTURE_SHARES_EQUIV
-                    elif f_unit == 1:
-                        shares_equiv = FUTURE_SHARES_EQUIV
-                    else:
+                    shares_equiv = 2000 # Default
+                    
+                    # Check for Mini/Small (name check required as unit is often 1 for both)
+                    c_name = str(getattr(contract, 'name', '') or "")
+                    if "小型" in c_name or "微型" in c_name:
+                        # [Safety] Skip Mini futures (100 shares) as we trade 1:1 against Stock Lots (1000/2000)
+                        # Ratio trading is not yet supported.
                         continue
+
+                    if f_unit == 2000:
+                        shares_equiv = 2000
+                    elif f_unit == 1:
+                        shares_equiv = 2000
+                    else:
+                        # Unknown unit size, assume Standard 2000 or pass
+                        pass
 
                     # Store candidate
                     scode = str(contract.underlying_code)
@@ -2310,7 +2411,12 @@ class StrategyEngine:
                     if unhedged == 1:
                          blocker = ps.stock_code
             if unhedged > 0:
-                print(f"[Strategy] Risk: Blocked by unhedged positions ({unhedged}). Blocker example: {blocker if 'blocker' in locals() else '?'}")
+                # Rate limit this specific log to avoid spamming the console
+                if not hasattr(self, "_last_unhedged_log_ts"):
+                     self._last_unhedged_log_ts = 0.0
+                if time.time() - self._last_unhedged_log_ts > 5.0:
+                     print(f"[Strategy] Risk: Blocked by unhedged positions ({unhedged}). Blocker example: {blocker if 'blocker' in locals() else '?'}")
+                     self._last_unhedged_log_ts = time.time()
                 return False
             if active >= MAX_OPEN_PAIRS:
                 print(f"[Strategy] Risk: Max open pairs reached ({active}/{MAX_OPEN_PAIRS})")
@@ -2394,6 +2500,11 @@ class StrategyEngine:
                 # if code == DBG_WATCH_STOCK: print(f"[Trace] Limit: No Pair State")
                 return None
             
+            # [FIX] Order Lock Check: If there is a pending order/signal, DO NOT process new quotes.
+            if getattr(ps, "order_pending", False):
+                 # print(f"[Strategy] Skip {target_stock}: Order Pending")
+                 return None
+
             # if code == DBG_WATCH_STOCK: print(f"[Trace] Post-Lock OK. State={ps.state}")
 
             now = time.time()
@@ -2409,7 +2520,7 @@ class StrategyEngine:
                      return None
 
                 # Increase cooldown to avoid spamming orders if they don't fill immediately
-                if now - ps.last_repair_ts < 5.0:
+                if now - ps.last_repair_ts < 10.0:
                     return None
 
                 duration = now - (ps.unhedged_ts or now)
@@ -2420,13 +2531,21 @@ class StrategyEngine:
                 
                 # Check pending orders for this stock
                 pending_orders = self.pos_mgr.get_inflight_orders(target_stock)
+                
+                # Check if we recently sent a REPAIR signal that might not be in "pending_orders" yet if it was IOC and didn't fill?
+                # Actually if it was IOC and didn't fill, inflight should be cleared.
+                # If it was ROD (Force), it should be in pending.
+                
                 if pending_orders:
                     # If we have pending orders, we should probably Cancel them rather than sending NEW orders
                     # to avoid race conditions or worsening the unhedged state.
-                    if now - ps.last_repair_ts > 5.0:
+                    # Wait at least 15s before cancelling to give it a chance to fill
+                    if now - ps.last_repair_ts > 15.0:
                         print(f"[Strategy] REPAIR {target_stock}: Found {len(pending_orders)} pending orders. Cancelling first...")
                         # Signal CANCEL ALL for this stock
                         ps.last_repair_ts = now
+                        # [FIX] Lock before signal
+                        self.pos_mgr.set_order_pending(target_stock, True)
                         return TradeSignal({
                             "type": "CANCEL_ALL",
                             "stock_code": target_stock
@@ -2465,6 +2584,9 @@ class StrategyEngine:
                 if action and qty > 0:
                     print(f"[Strategy] {target_stock} UNHEDGED ({duration:.1f}s) -> {action} qty={qty}")
                     ps.last_repair_ts = now
+                    ps.repair_failures = getattr(ps, "repair_failures", 0) + 1  # Increment failure count
+                    # [FIX] Lock before signal
+                    self.pos_mgr.set_order_pending(target_stock, True)
                     return TradeSignal({
                         "type": "REPAIR",
                         "sub_type": action,
@@ -2477,6 +2599,14 @@ class StrategyEngine:
 
             # pending states block new decisions
             if ps.state in (PositionState.PENDING_ENTRY, PositionState.PENDING_EXIT):
+                # [FIX] Timeout for Stuck PENDING states (Deadlock Prevention)
+                # If we are pending for too long, something is wrong (Order lost? Logic stuck?).
+                # Force REPAIRING to trigger CANCEL_ALL and cleanup.
+                last_ts = getattr(ps, "last_entry_ts", 0) if ps.state == PositionState.PENDING_ENTRY else getattr(ps, "last_close_ts", 0)
+                if last_ts > 0 and (now - last_ts) > 20.0:
+                     print(f"[Strategy] {target_stock} Stuck in {ps.state} > 20s. Forcing REPAIRING to unjam.")
+                     self.pos_mgr.set_state(target_stock, PositionState.REPAIRING)
+                     ps.unhedged_ts = now # Treat as unhedged to trigger immediate attention
                 return None
 
             f_code = ps.fut_code or futures[0]
@@ -2491,8 +2621,8 @@ class StrategyEngine:
             latency = max(now - _get_ts(s_q), now - _get_ts(f_q))
             
             # Super Debug Watch (Early)
-            if target_stock == DBG_WATCH_STOCK:
-                 print(f"[Watch EARLY] {target_stock} Latency={latency:.1f}s Bid={s_bid} Ask={s_ask} FBid={f_bid} FAsk={f_ask}")
+            # if target_stock == DBG_WATCH_STOCK:
+            #      print(f"[Watch EARLY] {target_stock} Latency={latency:.1f}s Bid={s_bid} Ask={s_ask} FBid={f_bid} FAsk={f_ask}")
 
             if latency > MAX_DATA_DELAY_SEC:
                 # if target_stock == DBG_WATCH_STOCK: print(f"[Watch REJECT] Latency {latency:.1f} > {MAX_DATA_DELAY_SEC}")
@@ -2549,7 +2679,13 @@ class StrategyEngine:
                         self._increment_risk_counter()
                         self.pos_mgr.set_future_pair(target_stock, f_code, future_shares_equiv=feq)
                         self.pos_mgr.set_state(target_stock, PositionState.PENDING_ENTRY)
+                        
+                        # [FIX] Set Entry TS to prevent flickering exit
+                        ps.last_entry_ts = now
+                        
                         print(f"[Strategy] OPEN {target_stock} Z={z_score:.2f} Mean={ps.basis_mean:.2f} Std={ps.basis_std:.2f} Net={net:.0f} Basis={basis:.2f}")
+                        # [FIX] Lock before signal
+                        self.pos_mgr.set_order_pending(target_stock, True)
                         return TradeSignal({
                             "type": "OPEN",
                             "stock_code": target_stock,
@@ -2565,6 +2701,12 @@ class StrategyEngine:
             # ---- EXIT ----
             elif ps.state == PositionState.HOLDING:
                 is_timeout = (ps.open_ts > 0 and (now - ps.open_ts) > MAX_HOLDING_SEC)
+                
+                # [FIX] Prevent Flickering: Don't close immediately after opening unless Stop Loss (TODO) or Timeout
+                if (now - ps.last_entry_ts) < 30.0 and not is_timeout:
+                    # Enforce 30s min hold
+                    return None
+                    
                 if z_score <= Z_EXIT or is_timeout:
                     s_bid_vol = _get_bid_vol(s_q)
                     f_ask_vol = _get_ask_vol(f_q)
@@ -2580,6 +2722,8 @@ class StrategyEngine:
                     self.pos_mgr.set_state(target_stock, PositionState.PENDING_EXIT)
                     print(f"[Strategy] CLOSE {target_stock} ({reason}) Z={z_score:.2f} Net={current_spread:.0f}")
 
+                    # [FIX] Lock before signal
+                    self.pos_mgr.set_order_pending(target_stock, True)
                     return TradeSignal({
                         "type": "CLOSE",
                         "stock_code": target_stock,
@@ -2872,10 +3016,20 @@ class ExecutionEngine:
             print(f"[Execution] cancel FAILED order_id={oid} (trade not found or cancel rejected)")
         return ok
 
-    def on_signal(self, sig: Dict[str, Any], api: sj.Shioaji):
-        typ = str(sig.get("type") or "")
-        stock_code = str(sig.get("stock_code") or "")
-        future_code = str(sig.get("future_code") or "")
+    # [FIX] Wrapper to ensure Order Lock is released
+    def on_signal(self, sig: TradeSignal, api: sj.Shioaji):
+        stock_code = sig.get("stock_code")
+        try:
+            self._on_signal_inner(sig, api)
+        finally:
+            if stock_code:
+                # Always unlock when ExecutionEngine is done with this signal
+                self.pos_mgr.set_order_pending(stock_code, False)
+
+    def _on_signal_inner(self, sig: Dict[str, Any], api: sj.Shioaji):
+        typ = sig.get("type")
+        stock_code = sig.get("stock_code")
+        future_code = sig.get("future_code") or ""
 
         if typ == "CANCEL_ALL":
             stock_code = str(sig.get("stock_code") or "")
@@ -2909,6 +3063,11 @@ class ExecutionEngine:
                     ok_cnt += 1
 
             print(f"[Execution] CANCEL_ALL done for {stock_code}. cancelled_ok={ok_cnt}/{len(inflight)}")
+            
+            # [FIX] Force clear any pending legs that we couldn't cancel (or even if we did).
+            # This prevents "zombie" pending orders from blocking the repair loop forever.
+            print(f"[Execution] Force clearing pending legs for {stock_code} to unblock repair loops.")
+            self.pos_mgr.force_clear_pending_legs(stock_code)
 
             # Optional: mark pair as repairing so Strategy won't open new positions
             try:
@@ -2958,6 +3117,13 @@ class ExecutionEngine:
                         if ref_px <= 0: ref_px = fallback_px
                         side = "buy"
                     else:
+                        # [FIX] Safety Guard: Don't SELL if we don't have stock
+                        curr_shares = getattr(ps, "pos_stock_shares", 0)
+                        if curr_shares <= 0:
+                             print(f"[Execution] Auto-Repair SKIP: Tried to SELL stock {stock_code} but shares={curr_shares}")
+                             self.pos_mgr.set_inflight(stock_code, False)
+                             return
+
                         action = sj.constant.Action.Sell
                         ref_px = _get_bid(quote) if quote else 0.0
                         if ref_px <= 0: ref_px = fallback_px
@@ -3199,11 +3365,19 @@ class ExecutionEngine:
         failed = sync.failed.is_set()
 
         if failed or (not ok):
-            print(f"[{phase.upper()}] timeout/failed -> set REPAIRING")
-            self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
-            ps = self.pos_mgr.get_pair(stock_code)
-            if ps and ps.unhedged_ts <= 0:
-                ps.unhedged_ts = time.time()
+            print(f"[{phase.upper()}] timeout/failed (ok={ok}, failed={failed}). Checking status...")
+            # [FIX] Don't force REPAIRING immediately. Let PositionManager or next loop handle it.
+            # If we force REPAIRING here, it overrides PENDING_ENTRY protection.
+            # Only set REPAIRING if we are sure it failed (failed flag set by callback error).
+            if failed:
+                 print(f"[{phase.upper()}] Explicit Fail Flag set. Setting REPAIRING.")
+                 self.pos_mgr.set_state(stock_code, PositionState.REPAIRING)
+                 ps = self.pos_mgr.get_pair(stock_code)
+                 if ps and ps.unhedged_ts <= 0:
+                     ps.unhedged_ts = time.time()
+            else:
+                 print(f"[{phase.upper()}] Timeout waiting for hedge. Leaving state as is (let PosMgr sync).")
+                 # Do NOT set REPAIRING here. Let sync_from_snapshot handle it naturally.
         else:
             if phase == "open":
                 self.pos_mgr.set_state(stock_code, PositionState.HOLDING)
@@ -3320,7 +3494,10 @@ class ThreadSafeApiWrapper:
 
     def update_status(self, *args, **kwargs):
         with self._lock:
-            return self._api.update_status(*args, **kwargs)
+            try:
+                return self._api.update_status(*args, **kwargs)
+            except Exception:
+                pass
 
     def update_order(self, *args, **kwargs):
         with self._lock:
@@ -3415,8 +3592,8 @@ class TradingSystem:
         print(f"[System] init Shioaji (simulation={SIMULATION})")
         self._raw_api = sj.Shioaji(simulation=SIMULATION)
         # Temporarily bypass wrapper to test if RLock is causing timeouts
-        self.api = self._raw_api 
-        # self.api = ThreadSafeApiWrapper(self._raw_api)
+        # self.api = self._raw_api 
+        self.api = ThreadSafeApiWrapper(self._raw_api)
 
         if not CA_API_KEY or not CA_SECRET_KEY:
             raise RuntimeError("Missing Sinopack_CA_API_KEY / Sinopack_CA_SECRET_KEY in .env")
@@ -3777,8 +3954,8 @@ class TradingSystem:
 
     def _thread_refresh_pairs_loop(self):
         # Initial Startup Delay to prevent API congestion
-        print("[Pairs] Waiting 10s before first scan...")
-        time.sleep(10.0)
+        print("[Pairs] Background scan starting in 2s...")
+        time.sleep(2.0)
 
         last_ts = 0.0
         while not self.is_stopped():
@@ -3790,9 +3967,32 @@ class TradingSystem:
 
             try:
                 pairs = self.discoverer.find_active_pairs(top_n=TOP_N_PAIRS) if self.discoverer else []
-                if not pairs:
+                
+                # MERGE EXISTING HOLDINGS (Active or Broken/Repairing)
+                existing_pairs = set()
+                all_ps = self.pos_mgr.all_pairs()
+                for ps in all_ps:
+                     # If we hold position OR it is explicitly tracked (e.g. broken/repairing/holding)
+                     # ps.state != EMPTY checks for HOLDING, REPAIRING, PENDING...
+                     if (ps.pos_stock_shares != 0 or ps.pos_fut_qty != 0 or ps.state != PositionState.EMPTY):
+                          if ps.stock_code and ps.fut_code:
+                               existing_pairs.add((ps.stock_code, ps.fut_code))
+                
+                # Convert pairs list to set for union
+                pairs_set = set(pairs)
+                combined_set = pairs_set.union(existing_pairs)
+                combined_pairs = list(combined_set)
+
+                if not combined_pairs:
                     print("[Pairs] no pairs found")
                     continue
+                
+                # Log usage of merged pairs
+                # if len(existing_pairs) > 0:
+                #      print(f"[Pairs] Monitoring {len(combined_pairs)} pairs (including {len(existing_pairs)} holdings).")
+
+                # Use combined list
+                pairs = combined_pairs
 
                 # ✅ 統一取 map（避免 Contracts.Futures[code] 各種取不到）
                 fut_contract_map = self.discoverer.get_future_contract_map() if self.discoverer else {}
@@ -3900,8 +4100,7 @@ class TradingSystem:
 
     def _check_broken_legs_startup(self):
         """
-        Scans for REPAIRING/Unhedged positions at startup.
-        Automated safe handling for daemon mode.
+        Interactive scan for REPAIRING/Unhedged positions at startup.
         """
         print("\n[System] Checking for broken/unhedged positions...")
         broken_list = []
@@ -3925,25 +4124,47 @@ class TradingSystem:
             return
 
         print(f"!!! FOUND {len(broken_list)} BROKEN/UNHEDGED POSITIONS !!!")
-        for ps in broken_list:
-            print(f"  -> {ps.stock_code}: Stock={ps.pos_stock_shares}, Future={ps.pos_fut_qty}, State={ps.state.name}")
+        for idx, ps in enumerate(broken_list):
+            print(f"  [{idx+1}] {ps.stock_code}: Stock={ps.pos_stock_shares}, Future={ps.pos_fut_qty}, State={ps.state.name}")
         
         if AUTO_CLOSE_BROKEN_LEGS:
              print("\n[System] AUTO_CLOSE_BROKEN_LEGS = True. Attempting to close all broken positions...")
-             for ps in broken_list:
-                 print(f"  -> Triggering Force Close for {ps.stock_code}...")
-                 self.exec_engine.force_close_position(self.api, ps.stock_code)
-             print("[System] Force close signals sent.\n")
-             return
-
-        print("\n[System] ⚠️ Daemon Mode: Skipping interactive force close.")
-        print("[System] Marking broken positions as IGNORED to prevent auto-repair loops.")
+             to_close = broken_list
+        else:
+             print("\n[Interactive] Enter indices to FORCE CLOSE (e.g. '1 3' or 'all') or press Enter to skip/monitor:")
+             try:
+                 # Standard input since this runs in main thread before keyboard monitor takes over
+                 choice = input().strip().lower()
+             except EOFError:
+                 choice = ""
+             
+             to_close = []
+             if choice == 'all':
+                 to_close = broken_list
+             elif choice:
+                 indices = choice.replace(',', ' ').split()
+                 for i in indices:
+                     if i.isdigit():
+                         idx = int(i) - 1
+                         if 0 <= idx < len(broken_list):
+                             to_close.append(broken_list[idx])
         
+        if to_close:
+            print(f"[System] Initiating Force Close for {len(to_close)} positions...")
+            for ps in to_close:
+                print(f"  -> Triggering Force Close for {ps.stock_code}...")
+                self.exec_engine.force_close_position(self.api, ps.stock_code)
+                # Ensure marked as REPAIRING so it's monitored and treated as such
+                self.pos_mgr.set_state(ps.stock_code, PositionState.REPAIRING)
+        else:
+            print("[System] Skipping force close. Positions will be monitored.")
+
+        # Ensure all broken list items are NOT ignored, so they are picked up by Monitor logic
         for ps in broken_list:
-            ps.repair_failures = 999 
-            ps.is_ignored = True
-        print("[System] These positions will be ignored by the strategy.\n")
-        return
+            ps.is_ignored = False
+            ps.repair_failures = 0 # Reset failure count to allow retry/monitoring
+        
+        print("\n")
 
 try:
     import termios, tty, select

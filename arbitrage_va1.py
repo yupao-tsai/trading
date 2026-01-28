@@ -886,6 +886,16 @@ class App:
                 last_heartbeat = time.time()
                 log("[Heartbeat] running... (q to quit)")
 
+                # Keep-Alive: 主動更新狀態以避免閒置斷線
+                if self.sjw.api:
+                    try:
+                        # 使用 update_status 作為 heartbeat
+                        self.sjw.api.update_status(self.sjw.api.stock_account)
+                        self.sjw.api.update_status(self.sjw.api.futopt_account)
+                    except Exception as e:
+                        # 如果遇到 Token 過期，這裡也可以擴充重登邏輯
+                        log(f"[Warn] Keep-alive (update_status) failed: {e}")
+
             time.sleep(0.05)
 
         log("[System] stopping...")

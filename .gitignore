@@ -1,1 +1,15 @@
 .env
+__pycache__/
+*.log
+*.csv
+*.txt
+*.json
+*.jsonl
+.DS_Store
+data_cache/
+rl_outputs/
+tb_logs/
+moomoo_OpenD_*
+*.zip
+*.pth
+.venv/
