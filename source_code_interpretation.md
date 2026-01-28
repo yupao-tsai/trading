@@ -24,16 +24,6 @@
     *   `ZOMBIE_TIMEOUT`: 交易卡死多久後強制清除。
     *   `REPAIR_COOLDOWN`: 觸發修復後要冷靜多久。
 
-### H. InstrumentRegistry (商品註冊表) - **[New!]**
-*   **用途**: 集中管理所有商品的合約規格與單位換算，確保全系統單位統一。
-*   **關鍵變數**:
-    *   `_specs`: 字典結構 `{code: {'type': 'Stock'|'Future', 'multiplier': int}}`。
-        *   **Stock**: `multiplier` 通常為 1000 (股)。
-        *   **Future**: `multiplier` 為合約乘數 (例如台指期 200, 個股期 2000)。
-*   **功能**:
-    *   `get_ratio(stock, future)`: 動態計算避險比例。例如 `Fut(2000) / Stk(1000) = 2.0`。
-    *   確保系統能支援各種不同規格的商品 (如不同倍數的個股期)，而不需要硬編碼。
-
 ### B. MarketData (行情資料庫)
 *   **用途**: Thread-safe 的行情快照儲存。
 *   **特點**:
@@ -81,6 +71,15 @@
     3.  **Rank**: 依照「股票量+期權量」總分排序。
     4.  **Select**: 選取前 N 名 (Top 20) 回傳給 Manager 進行訂閱。
 
+### H. InstrumentRegistry (商品註冊表) - **[New!]**
+*   **用途**: 集中管理所有商品的合約規格與單位換算，確保全系統單位統一。
+*   **關鍵變數**:
+    *   `_specs`: 字典結構 `{code: {'type': 'Stock'|'Future', 'multiplier': int}}`。
+        *   **Stock**: `multiplier` 通常為 1000 (股)。
+        *   **Future**: `multiplier` 為合約乘數 (例如台指期 200, 個股期 2000)。
+*   **功能**:
+    *   `get_ratio(stock, future)`: 動態計算避險比例。例如 `Fut(2000) / Stk(1000) = 2.0`。
+    *   確保系統能支援各種不同規格的商品 (如不同倍數的個股期)，而不需要硬編碼。
 ---
 
 ## 3. 類別關係圖 (Class Diagram)
@@ -187,50 +186,61 @@ classDiagram
 
 ## 4. 關鍵調用流程 (Key Call Flows)
 
-### A. 系統啟動與註冊流程 (System Startup & Registration)
-完整展示所有元件的初始化順序 (`__init__`) 以及 API 相關的註冊點。
+### A. 系統啟動與註冊流程 (System Startup & Registration) - **Deep Dive**
+這一節描述了系統從 `main()` 入口到完全運作的每一步，特別是 **Worker Queue** 與 **Background Logic** 的初始化。
 
 ```mermaid
 sequenceDiagram
-    participant Main as Main Entry(GUI)
+    participant Main as Main.py
     participant TM as TransManager
+    participant QW as QuoteWorker(Thread)
+    participant EW as EventWorker(Thread)
     participant Exec as ExecutionEngine
     participant MD as MarketData
-    participant Strat as StrategyEngine
-    participant Ledger as PortfolioLedger
-    participant Rep as AccountReporter
-    participant API as Shioaji
-
-    Note over Main: 1. Core Component Init
+    participant API as ShioajiAPI
+    
+    Note over Main: 1. Core Initialization
     Main->>TM: TransactionManager()
+    TM->>TM: Init Locks (_lock, _quote_lock)
+    TM->>TM: Init Queues (event_queue, _pending_quote_codes)
+    
+    TM->>EW: Start EventWorker Thread
+    Note right of EW: Waiting for Order Events...
+    
+    TM->>QW: Start QuoteWorker Thread
+    Note right of QW: Waiting for Tick Signals...
+    
     TM->>Exec: ExecutionEngine()
     TM->>MD: MarketData()
-    TM->>Strat: StrategyEngine()
-    TM->>Ledger: PortfolioLedger()
-    TM->>Rep: AccountReporter()
-    
-    Note right of TM: _worker_thread Started
     
     Note over Main: 2. Login & Connection
     Main->>TM: start()
     TM->>Exec: login()
-    Exec->>API: Shioaji(simulation=...)
-    Exec->>API: api.login(...)
-    Exec->>API: api.activate_ca(...)
-    Note right of Exec: Register Order Callback
+    Exec->>API: shioaji.Shioaji(simulation=True)
+    Exec->>API: login(...) & activate_ca(...)
     Exec->>API: set_order_callback(self._order_cb)
     
-    Note over Main: 3. Quote Registration
-    TM->>API: set_on_tick_stk_v1_callback(_on_tick_stk)
-    TM->>API: set_on_bidask_stk_v1_callback(_on_quote_stk)
-    TM->>API: set_on_tick_fop_v1_callback(...)
-    TM->>API: set_on_bidask_fop_v1_callback(...)
+    Note over Main: 3. Pair Discovery (Blocking)
+    Main->>TM: discover_and_subscribe()
+    TM->>API: List Positions (Sync Held)
+    TM->>API: Scan Contracts & Volumes
+    TM->>API: quote.subscribe(Top N Pairs)
     
-    Note over Main: 4. GUI Launch
-    Main->>Main: ArbitrageDashboard(TM)
-    Main->>Main: discover_and_subscribe() (See Flow B)
-    Main->>Main: Start Logic Thread (See Flow H)
-    Main->>Main: GUI.run()
+    Note over Main: 4. GUI & Logic Loop
+    Main->>Main: Launch GUI (Dashboard)
+    
+    rect rgb(240, 255, 240)
+        Note right of Main: Background Logic Thread
+        Main->>Main: Start Thread(background_logic)
+        loop Every 0.1s
+            Main->>TM: run_step()
+            TM->>TM: Check Timeouts
+            TM->>TM: Sync Balance (Every 2s/30s)
+            TM->>TM: Connection Watchdog
+        end
+    end
+    
+    Main->>Main: GUI.run() (Main Thread)
 ```
 
 ### B. 配對掃描與訂閱流程 (Pair Discovery)
