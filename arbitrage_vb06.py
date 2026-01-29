@@ -2399,6 +2399,7 @@ class PairDiscovery:
         Build underlying_code -> best future contract (near month heuristic).
         """
         u2f_list: Dict[str, List[Any]] = {}
+        all_futures = []
         try:
             for contract in iter_future_contracts(self.api):
                 if not contract:

@@ -316,7 +316,7 @@ class ArbitrageDashboard:
         # Fund Calc
         est_stock_cost = 0.0
         est_fut_margin = 0.0
-        stock_mult = self.mgr.ledger.stock_multiplier
+        stock_mult = 1000 # Default stock multiplier
         fut_mult = self.mgr.ledger.fut_multiplier_default
         fut_m_ratio = self.mgr.ledger.fut_margin_ratio
         
